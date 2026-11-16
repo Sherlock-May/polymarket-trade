@@ -1,0 +1,12 @@
+.venv/
+.venv-*/
+.env
+__pycache__/
+.pytest_cache/
+data/
+logs/
+reports/
+*.egg-info/
+.coverage
+docs/official/sdk-tree.json
+pytest-cache-files-*/

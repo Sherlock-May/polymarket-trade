@@ -1,0 +1,29 @@
+{
+  "settings": {
+    "max_open_exposure": "20",
+    "max_daily_loss": "30",
+    "paper_initial_balance": "100",
+    "discovery_interval_seconds": 30,
+    "reconcile_interval_seconds": 5,
+    "status_interval_seconds": 30,
+    "max_clock_skew_seconds": 3,
+    "book_max_age_seconds": 20,
+    "paper_latency_ms": 500,
+    "paper_queue_multiplier": "1.5",
+    "cancel_before_deadline_seconds": 1
+  },
+  "markets": [
+    {"id":"btc-4h","enabled":false,"symbol":"BTC","timeframe":"4h","entry_price":"0.10","shares":"10","take_profit_price":"0.20","entry_window_seconds":3600,"preopen_seconds":86400},
+    {"id":"btc-1h","enabled":false,"symbol":"BTC","timeframe":"1h","entry_price":"0.10","shares":"10","take_profit_price":"0.20","entry_window_seconds":600,"preopen_seconds":86400},
+    {"id":"btc-15m","enabled":false,"symbol":"BTC","timeframe":"15m","entry_price":"0.10","shares":"10","take_profit_price":"0.20","entry_window_seconds":120,"preopen_seconds":86400},
+    {"id":"btc-5m","enabled":false,"symbol":"BTC","timeframe":"5m","entry_price":"0.10","shares":"10","take_profit_price":"0.20","entry_window_seconds":60,"preopen_seconds":86400},
+    {"id":"eth-4h","enabled":false,"symbol":"ETH","timeframe":"4h","entry_price":"0.10","shares":"10","take_profit_price":"0.20","entry_window_seconds":3600,"preopen_seconds":86400},
+    {"id":"eth-1h","enabled":false,"symbol":"ETH","timeframe":"1h","entry_price":"0.10","shares":"10","take_profit_price":"0.20","entry_window_seconds":600,"preopen_seconds":86400},
+    {"id":"eth-15m","enabled":false,"symbol":"ETH","timeframe":"15m","entry_price":"0.10","shares":"10","take_profit_price":"0.20","entry_window_seconds":120,"preopen_seconds":86400},
+    {"id":"eth-5m","enabled":true,"symbol":"ETH","timeframe":"5m","entry_price":"0.10","shares":"5","take_profit_price":"0.20","entry_window_seconds":60,"preopen_seconds":86400},
+    {"id":"sol-4h","enabled":false,"symbol":"SOL","timeframe":"4h","entry_price":"0.10","shares":"10","take_profit_price":"0.20","entry_window_seconds":3600,"preopen_seconds":86400},
+    {"id":"sol-1h","enabled":false,"symbol":"SOL","timeframe":"1h","entry_price":"0.10","shares":"10","take_profit_price":"0.20","entry_window_seconds":600,"preopen_seconds":86400},
+    {"id":"sol-15m","enabled":false,"symbol":"SOL","timeframe":"15m","entry_price":"0.10","shares":"10","take_profit_price":"0.20","entry_window_seconds":120,"preopen_seconds":86400},
+    {"id":"sol-5m","enabled":false,"symbol":"SOL","timeframe":"5m","entry_price":"0.10","shares":"10","take_profit_price":"0.20","entry_window_seconds":60,"preopen_seconds":86400}
+  ]
+}

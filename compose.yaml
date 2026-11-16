@@ -1,0 +1,16 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    stop_grace_period: 120s
+    volumes:
+      - ./markets.json:/app/markets.json:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./reports:/app/reports
+    healthcheck:
+      test: ["CMD-SHELL", "python scripts/healthcheck.py --mode $${BOT_HEALTH_MODE:-paper}"]
+      interval: 60s
+      timeout: 10s
+      retries: 3

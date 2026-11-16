@@ -1,0 +1,27 @@
+[Unit]
+Description=Polymarket next-round order manager
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=polymarket
+Group=polymarket
+WorkingDirectory=/opt/polymarket-bot
+ExecStart=/opt/polymarket-bot/.venv/bin/python -u main.py run --record
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=120
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/polymarket-bot/data /opt/polymarket-bot/logs /opt/polymarket-bot/reports
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
