@@ -95,6 +95,8 @@ def simple_message(db, name, data, now):
         return f"止盈处理中 | {label} | 待保护 {data.get('shares')} 份，正在核实可卖余额"
     if name == '旧止盈单已结束':
         return f"旧止盈单已结束 | {label} | 市场已结算且无活动挂单，收益以成交及结算记录为准"
+    if name == '恢复待预挂轮次':
+        return f"恢复待预挂 | {label} | 上次退出前未下过单，重新等待预挂检查"
     if name == '持仓暂不可挂止盈':
         return f"止盈暂未挂出 | {label} | 可卖 {data.get('shares')} 份，账户余额 {data.get('balance', '?')} 份，最少 {data.get('min_size')} 份，授权 {'足够' if data.get('allowance_ok') else '不足'}"
     if name == '止盈处理耗时':

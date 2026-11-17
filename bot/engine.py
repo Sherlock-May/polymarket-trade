@@ -625,20 +625,54 @@ class Engine:
             self.save()
             await asyncio.sleep(30)
 
-    async def discover_loop(self):
+    def resume_waiting_rounds(self):
+        enabled = {r.id for r in self.config.markets if r.enabled}
+        for slug, r in self.rounds.items():
+            if (r["rule"]["id"] in enabled and self.api.now() < r["market"]["start"]
+                    and r["skip_reason"] == "配置关闭或安全停机" and not r["entry_attempted"]
+                    and not r.get("settlement") and not any(o["slug"] == slug for o in self.orders.values())
+                    and r["status"] != "FINAL"):
+                r.update(entry_closed=False, status="WAITING", skip_reason="")
+                self.db.put_round(r)
+                self.emit("恢复待预挂轮次", slug=slug)
+
+    async def discover_rule_loop(self, rule):
         while not self.stopping:
-            for rule in list(self.config.markets):
-                if not rule.enabled:
-                    continue
-                try:
+            try:
+                async with asyncio.timeout(20):
                     market = await self.api.discover(rule)
-                    if market:
-                        await self.queue.put(("discovered", (rule, market)))
-                    else:
-                        self.limited("未找到下一轮市场", rule.id)
-                except Exception as exc:
-                    self.limited("市场发现失败", rule.id, error_type=type(exc).__name__)
+                if market:
+                    previous = self.rounds.get(market.slug)
+                    self.limited("市场发现检查", rule.id, slug=market.slug,
+                                 start=utc_iso(market.start), existing=previous is not None,
+                                 entry_closed=previous.get("entry_closed") if previous else False,
+                                 skip_reason=previous.get("skip_reason", "") if previous else "")
+                    await self.queue.put(("discovered", (rule, market)))
+                else:
+                    self.limited("未找到下一轮市场", rule.id)
+            except Exception as exc:
+                self.limited("市场发现失败", rule.id, **error_fields(exc))
             await asyncio.sleep(self.config.settings["discovery_interval_seconds"])
+
+    async def discover_loop(self):
+        tasks = {}
+        try:
+            while not self.stopping:
+                rules = {r.id: r for r in self.config.markets if r.enabled}
+                for ident in list(tasks):
+                    rule, task = tasks[ident]
+                    if rules.get(ident) != rule:
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                        del tasks[ident]
+                for ident, rule in rules.items():
+                    if ident not in tasks:
+                        tasks[ident] = (rule, asyncio.create_task(self.discover_rule_loop(rule)))
+                await asyncio.sleep(1)
+        finally:
+            for _, task in tasks.values():
+                task.cancel()
+            await asyncio.gather(*(task for _, task in tasks.values()), return_exceptions=True)
 
     async def run(self, config_path, run_seconds=None):
         from .reporting import report
@@ -649,6 +683,7 @@ class Engine:
         config_mtime = Path(config_path).stat().st_mtime_ns
         try:
             await self.reconcile()
+            self.resume_waiting_rounds()
             while not self.stopping:
                 if run_seconds and time.time() - self.started_at >= run_seconds:
                     self.stop_reason = "达到限定运行时间"

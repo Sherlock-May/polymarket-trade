@@ -60,6 +60,7 @@ class PublicAPI:
             self.series[rule.series_slug] = exact[0]["id"]
         now = self.now()
         found = []
+        invalid = 0
         # 按结束时间排序，分页查真实系列；不使用 Unix 对齐猜 token 或市场时间。
         for page in range(10):
             events = await self.get(GAMMA + "/events", series_id=self.series[rule.series_slug],
@@ -67,11 +68,17 @@ class PublicAPI:
                                     order="endDate", ascending="true", limit=100, offset=100 * page)
             for ev in events:
                 for raw in ev.get("markets", []):
-                    market = Market.parse(raw, ev, rule)
+                    try:
+                        market = Market.parse(raw, ev, rule)
+                    except (ValueError, KeyError, TypeError):
+                        invalid += 1
+                        continue
                     if market.end > now and (not next_only or market.start > now):
                         found.append(market)
             if found or len(events) < 100:
                 break
+        if not found and invalid:
+            raise ValueError("系列中没有通过周期和交易规格校验的未来市场")
         return min(found, key=lambda m: m.start) if found else None
 
     async def market(self, slug):
