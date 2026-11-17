@@ -199,6 +199,7 @@ async def test_account_queue_processed_first_and_market_backlog_is_bounded(engin
     engine.on_message = handle
     engine.user_queue.put_nowait(('account', {}))
     engine.queue.put_nowait(('market', {}))
+    await engine.drain_user_messages()
     await engine.drain_messages()
     assert seen[0] == 'account'
     assert len(seen) <= 201
@@ -217,7 +218,7 @@ async def test_slow_clock_task_does_not_block_account_queue(engine):
     try:
         await asyncio.wait_for(entered.wait(), 1)
         engine.user_queue.put_nowait(('user_connected', {}))
-        await asyncio.wait_for(engine.drain_messages(), 1)
+        await asyncio.wait_for(engine.drain_user_messages(), 1)
         assert engine.reconcile_requested
         assert not task.done()
     finally:

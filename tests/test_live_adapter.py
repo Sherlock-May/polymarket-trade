@@ -214,3 +214,62 @@ async def test_live_confirmed_fill_places_exit_before_manage_and_does_not_duplic
     await engine.accept_fills([fill])
     await engine.protect(engine.rounds['test-round'])
     assert len([o for o in engine.orders.values() if o['side'] == 'SELL']) == 1
+
+
+@pytest.mark.parametrize('status', ['CONFIRMED', 'MATCHED'])
+async def test_authenticated_push_can_protect_without_full_rest_reconcile(engine, status):
+    order = await engine.submit(engine.rounds['test-round'], 'up', 'BUY', '0.10', '10', 'ENTRY')
+    order['exchange_id'] = 'server-buy'
+    posts = []
+    class Client:
+        async def get_balance_allowance(self, **kwargs):
+            return NS(balance=10000000, allowances={'spender':10000000})
+        async def create_limit_order(self, **kwargs):
+            assert kwargs['side'] == 'SELL' and kwargs['size'] == D('10')
+            return 'signed-exit'
+        async def post_order(self, signed):
+            posts.append(signed)
+            return NS(ok=True, order_id='server-exit')
+    engine.mode = 'live'
+    engine.broker = LiveBroker(engine, Client())
+    trade = NS(id='push-trade', taker_order_id='other', maker_orders=[NS(order_id='server-buy', price=D('.10'), matched_amount=D('10'))],
+               status=status, matched_at=datetime.fromtimestamp(engine.api.now(), timezone.utc), transaction_hash='tx')
+    event = NS(type='trade', payload=trade)
+    await engine.on_message('user_update', event)
+    await engine.on_message('user_update', event)
+    if status == 'CONFIRMED':
+        assert posts == ['signed-exit']
+        await engine.accept_fills(engine.broker.trade_fills(trade, list(engine.orders.values())))
+        assert posts == ['signed-exit'] and len(engine.fills) == 1
+    else:
+        assert posts == [] and engine.fills == []
+
+
+async def test_concurrent_exit_checks_cannot_reserve_same_inventory(engine):
+    import asyncio
+    order = await engine.submit(engine.rounds['test-round'], 'up', 'BUY', '0.10', '10', 'ENTRY')
+    await engine.accept_fills([asdict(Fill('inventory', order['local_id'], '.10', '10', '0', 'actual', engine.api.now(), 'MAKER'))])
+    original = engine.broker.available
+    async def slow_available(*args):
+        await asyncio.sleep(.01)
+        return await original(*args)
+    engine.broker.available = slow_available
+    await asyncio.gather(engine.protect(engine.rounds['test-round']), engine.protect(engine.rounds['test-round']))
+    assert len([o for o in engine.orders.values() if o['side'] == 'SELL']) == 1
+
+
+@pytest.mark.parametrize('sent', [False, True])
+async def test_shutdown_during_exit_submission_preserves_uncertainty(engine, sent):
+    import asyncio
+    engine.mode = 'live'
+    class Broker:
+        async def submit(self, order, market, deadline):
+            if sent:
+                order['status'] = 'UNKNOWN'
+            raise asyncio.CancelledError()
+    engine.broker = Broker()
+    with pytest.raises(asyncio.CancelledError):
+        await engine.submit(engine.rounds['test-round'], 'up', 'SELL', '.20', '10', 'TAKE_PROFIT')
+    order = next(iter(engine.orders.values()))
+    assert order['status'] == ('UNKNOWN' if sent else 'REJECTED')
+    assert engine.db.orders()[0]['status'] == order['status']

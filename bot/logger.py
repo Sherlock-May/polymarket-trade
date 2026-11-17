@@ -48,6 +48,13 @@ def setup(mode):
         for handler in (logging.StreamHandler(), RotatingFileHandler(f"logs/{mode}-simple.log", maxBytes=10_000_000, backupCount=10, encoding="utf-8")):
             handler.setFormatter(ZonedFormatter("[%(asctime)s] %(message)s"))
             simple.addHandler(handler)
+    trades = logging.getLogger('bot.trades')
+    trades.propagate = False
+    trades.setLevel(logging.INFO)
+    if not trades.handlers:
+        handler = RotatingFileHandler(f'logs/{mode}-trades.log', maxBytes=10_000_000, backupCount=10, encoding='utf-8')
+        handler.setFormatter(ZonedFormatter('[%(asctime)s] %(message)s'))
+        trades.addHandler(handler)
     # SDK/httpx 请求日志可能含签名查询参数；禁止开启底层调试日志。
     for name in ("httpx", "httpcore", "websockets", "polymarket"):
         logging.getLogger(name).setLevel(logging.WARNING)
@@ -90,6 +97,8 @@ def simple_message(db, name, data, now):
         return f"止盈暂未挂出 | {label} | 可卖 {data.get('shares')} 份，账户余额 {data.get('balance', '?')} 份，最少 {data.get('min_size')} 份，授权 {'足够' if data.get('allowance_ok') else '不足'}"
     if name == '止盈处理耗时':
         return f"止盈处理返回 | {label} | 耗时 {data.get('milliseconds')} 毫秒（是否成功以挂单结果为准）"
+    if name == '止盈重试暂停需检查':
+        return f"止盈重试暂停 | {label} | 已有 {data.get('rejected')} 笔被拒，需检查拒单原因"
     if name == "撤单已确认" and order and r:
         if order['side'] != 'BUY':
             return f"卖单撤销已确认 | {label} | {outcome}"
@@ -128,5 +137,27 @@ def event(db, log, name, level="INFO", **data):
         message = simple_message(db, name, data, time.time())
         if message:
             logging.getLogger("bot.simple").log(getattr(logging, level), "%s", message)
+        trade_text = trade_message(db, name, data, message)
+        if trade_text:
+            logging.getLogger('bot.trades').log(getattr(logging, level), '%s', trade_text)
     except Exception as exc:
         log.error("简洁日志生成失败 %s", dumps(error_fields(exc)))
+
+
+def trade_message(db, name, data, message):
+    if not message:
+        return None
+    if name in {'真实成交', '模拟成交'}:
+        timestamp = data.get('matched_at')
+        timing = _local_time(timestamp) if timestamp is not None else '未提供'
+        result = '买入已成交，止盈结果待后续确认' if data['side'] == 'BUY' else '止盈卖出已成交（可能为部分成交）'
+        return f"{result} | {message} | 订单 {data.get('order', '?')} | 实际撮合 {timing}"
+    order_id = data.get('order')
+    row = db.conn.execute('SELECT data FROM orders WHERE local_id=?', (order_id,)).fetchone() if order_id else None
+    order = json.loads(row[0]) if row else None
+    if order and order['purpose'] == 'TAKE_PROFIT' and name in {'订单被接受', '订单被拒绝', '订单未发送', '提交结果未知禁止重复下单', '撤单已确认'}:
+        buys = [o['local_id'] for o in db.orders() if o['slug'] == order['slug'] and o['asset_id'] == order['asset_id'] and o['side'] == 'BUY']
+        return f"{message} | 止盈订单 {order_id} | 对应买单 {','.join(buys)}"
+    if name in {'止盈处理中', '持仓暂不可挂止盈', '止盈保护异常', '止盈处理耗时', '止盈重试暂停需检查', '最终结算已确认'}:
+        return message
+    return None

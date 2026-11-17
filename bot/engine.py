@@ -40,6 +40,7 @@ class Engine:
         self.queue = asyncio.Queue(maxsize=10000)
         self.user_queue = asyncio.Queue(maxsize=10000)
         self.reconcile_requested = False
+        self.protect_locks = {}
         self.throttle = {}
         self.cancel_retries = {}
         self.recording = None
@@ -182,7 +183,7 @@ class Engine:
                 o["status"] = "FILLED"
             self.save()
             self.emit("真实成交" if self.mode == "live" else "模拟成交", slug=o["slug"], side=o["side"], asset=o["asset_id"],
-                      price=f["price"], shares=f["shares"], fee=f["fee"], fee_kind=f["fee_kind"], fill_id=f["id"])
+                      order=o['local_id'], matched_at=f['timestamp'], price=f["price"], shares=f["shares"], fee=f["fee"], fee_kind=f["fee_kind"], fill_id=f["id"])
         if self.mode == "live":
             # 确认成交后先保护库存，不等待队列中下一次全账户对账。
             for slug in sorted(protect_rounds):
@@ -253,6 +254,13 @@ class Engine:
                 result = await self.broker.submit(o, m, r["deadline"] if side == "BUY" and self.mode == "live" else None)
             o.update(result)
             self.emit("订单被接受" if o["status"] == "LIVE" else "订单被拒绝", order=o["local_id"], status=o["status"], reason=o.get("reason", ""))
+        except asyncio.CancelledError:
+            # 停机取消后台成交任务时，不能留下永远占用库存的未发送 INTENT。
+            o["status"] = "REJECTED" if self.mode == "live" and o["status"] == "INTENT" else "UNKNOWN"
+            self.save()
+            self.emit("订单未发送" if o["status"] == "REJECTED" else "提交结果未知禁止重复下单", "ERROR",
+                      order=o["local_id"], error_type="CancelledError")
+            raise
         except Exception as exc:
             if self.mode == "live" and o["status"] == "INTENT":
                 o["status"] = "REJECTED"
@@ -323,6 +331,11 @@ class Engine:
                 break
 
     async def protect(self, r):
+        lock = self.protect_locks.setdefault(r['market']['slug'], asyncio.Lock())
+        async with lock:
+            await self._protect(r)
+
+    async def _protect(self, r):
         m, rule = self.market(r["market"]["slug"]), Rule(**r["rule"])
         if self.api.now() >= m.end or r.get("settlement"):
             return
@@ -335,7 +348,7 @@ class Engine:
             recent = [o for o in self.orders.values() if o["slug"] == m.slug and o["asset_id"] == token and o["side"] == "SELL"]
             rejected = [o for o in recent if o["status"] == "REJECTED"]
             if len(rejected) >= 5 or (rejected and self.api.now() - rejected[-1]["created_at"] < min(60, 2 ** len(rejected))):
-                self.limited("止盈重试暂停需检查", token, rejected=len(rejected))
+                self.limited("止盈重试暂停需检查", token, slug=m.slug, rejected=len(rejected))
                 continue
             try:
                 started = time.monotonic()
@@ -504,6 +517,8 @@ class Engine:
                 for o in self.orders.values():
                     if o.get("exchange_id") in ids and o["side"] == "BUY":
                         self.rounds[o["slug"]]["entry_closed"] = True
+                if p.status == 'CONFIRMED' and hasattr(self.broker, 'trade_fills'):
+                    await self.accept_fills(self.broker.trade_fills(p, list(self.orders.values())))
             elif data.type == "order" and p.size_matched > 0:
                 for o in self.orders.values():
                     if o.get("exchange_id") == str(p.id):
@@ -526,13 +541,26 @@ class Engine:
         elif kind == "feed_connected":
             self.emit("行情订阅连接成功", **data)
 
-    async def drain_messages(self):
+    async def drain_user_messages(self):
         # 账户消息独立排队，避免大量盘口更新饿死成交及止盈处理。
         for _ in range(64):
             if self.user_queue.empty():
                 break
             kind, data = self.user_queue.get_nowait()
             await self.on_message(kind, data)
+
+    async def account_worker(self):
+        while True:
+            try:
+                kind, data = await self.user_queue.get()
+                await self.on_message(kind, data)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.connection_reconciled = False
+                self.limited('账户推送处理异常', 'user', **error_fields(exc))
+
+    async def drain_messages(self):
         started = time.monotonic()
         for _ in range(200):
             if self.queue.empty() or time.monotonic() - started > 0.05:
@@ -578,6 +606,7 @@ class Engine:
         from .reporting import report
         discovery = asyncio.create_task(self.discover_loop())
         housekeeping = asyncio.create_task(self.housekeeping())
+        account_worker = asyncio.create_task(self.account_worker())
         config_mtime = Path(config_path).stat().st_mtime_ns
         try:
             await self.reconcile()
@@ -626,7 +655,8 @@ class Engine:
             self.stopping = True
             discovery.cancel()
             housekeeping.cancel()
-            await asyncio.gather(discovery, housekeeping, return_exceptions=True)
+            account_worker.cancel()
+            await asyncio.gather(discovery, housekeeping, account_worker, return_exceptions=True)
             self.emit("安全停机开始", reason=self.stop_reason)
             await self.reconcile()
             for o in list(self.orders.values()):
@@ -636,6 +666,7 @@ class Engine:
             stop_deadline = time.monotonic() + 15
             while any(o["side"] == "BUY" and o["status"] in ACTIVE for o in self.orders.values()) and time.monotonic() < stop_deadline:
                 await asyncio.sleep(0.5)
+                await self.drain_user_messages()
                 await self.drain_messages()
                 await self.reconcile()
                 for o in list(self.orders.values()):

@@ -206,6 +206,24 @@ class LiveBroker:
             order["status"] = "FILLED"
         return False
 
+    def trade_fills(self, trade, local):
+        if trade.status != "CONFIRMED" or getattr(trade, "matched_at", None) is None:
+            return []
+        known = {o.get("exchange_id"): o for o in local if o.get("exchange_id")}
+        legs = []
+        if str(trade.taker_order_id) in known:
+            legs.append((known[str(trade.taker_order_id)], trade.price, trade.size, "TAKER"))
+        for maker in (trade.maker_orders or []):
+            if str(maker.order_id) in known:
+                legs.append((known[str(maker.order_id)], maker.price, maker.matched_amount, "MAKER"))
+        fills = []
+        for o, price, size, liquidity in legs:
+            fee = estimate_fee(self.engine.market(o['slug']), price, size, liquidity)
+            fills.append(asdict(Fill(f"{trade.id}:{o['local_id']}", o['local_id'], str(price), str(size), str(fee),
+                                    'actual' if liquidity == 'MAKER' else 'estimated', trade.matched_at.timestamp(),
+                                    liquidity, tx_hash=str(trade.transaction_hash or ''))))
+        return fills
+
     async def reconcile(self):
         fills = []
         for r in self.engine.rounds.values():
@@ -279,11 +297,7 @@ class LiveBroker:
                         r["entry_closed"] = True
                     if trade.status != "CONFIRMED":
                         continue
-                    fee = estimate_fee(self.engine.market(slug), price, size, liquidity)
-                    # MAKER 无手续费可确认为零；TAKER 曲线估算不伪装成实际到账。
-                    fee_kind = "actual" if liquidity == "MAKER" else "estimated"
-                    fills.append(asdict(Fill(f"{trade.id}:{o['local_id']}", o["local_id"], str(price), str(size), str(fee), fee_kind,
-                                             trade.matched_at.timestamp(), liquidity, tx_hash=str(trade.transaction_hash or ""))))
+                fills.extend(self.trade_fills(trade, local))
         return fills
 
     async def close(self):
