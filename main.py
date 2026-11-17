@@ -147,9 +147,12 @@ async def run(args, config):
                 if args.record:
                     Path("data/recordings").mkdir(parents=True, exist_ok=True)
                     engine.recording = Path(f"data/recordings/{int(time.time())}.jsonl").open("a", encoding="utf-8")
+                def request_stop(signum, _frame):
+                    engine.stop_reason = f"收到 {signal.Signals(signum).name} 信号"
+                    engine.stopping = True
                 for sig in (signal.SIGINT, signal.SIGTERM):
                     try:
-                        signal.signal(sig, lambda *_: setattr(engine, "stopping", True))
+                        signal.signal(sig, request_stop)
                     except ValueError:
                         pass
                 engine.emit("程序启动", enabled=[r.id for r in config.markets if r.enabled], database=db_path)

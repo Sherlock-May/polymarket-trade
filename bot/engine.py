@@ -28,6 +28,7 @@ class Engine:
         self.fill_ids = {f["id"] for f in self.fills}
         self.broker = None
         self.stopping = False
+        self.stop_reason = "未记录原因"
         self.user_connected = mode == "paper"
         self.started_at = time.time()
         self.last_reconcile = 0
@@ -533,6 +534,7 @@ class Engine:
             await self.reconcile()
             while not self.stopping:
                 if run_seconds and time.time() - self.started_at >= run_seconds:
+                    self.stop_reason = "达到限定运行时间"
                     self.stopping = True
                     break
                 try:
@@ -579,11 +581,14 @@ class Engine:
                     self.connection_reconciled = False
                     self.emit("运行异常暂停新增风险", "ERROR", error_type=type(exc).__name__)
                 await asyncio.sleep(0.2)
+        except BaseException as exc:
+            self.stop_reason = f"运行中断：{type(exc).__name__}"
+            raise
         finally:
             self.stopping = True
             discovery.cancel()
             await asyncio.gather(discovery, return_exceptions=True)
-            self.emit("安全停机开始")
+            self.emit("安全停机开始", reason=self.stop_reason)
             await self.reconcile()
             for o in list(self.orders.values()):
                 if o["side"] == "BUY" and o["status"] in ACTIVE:
