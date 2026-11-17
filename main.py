@@ -141,7 +141,7 @@ async def run(args, config):
                         raise ValueError("平台地区检查未通过，不启动实盘")
                     engine.geo_allowed, engine.last_geo = True, api.now()
                     engine.broker = await LiveBroker.create(engine)
-                    user_task = asyncio.create_task(user_feed(engine.broker.client, engine.queue))
+                    user_task = asyncio.create_task(user_feed(engine.broker.client, engine.user_queue))
                 else:
                     engine.broker = PaperBroker(engine)
                 if args.record:

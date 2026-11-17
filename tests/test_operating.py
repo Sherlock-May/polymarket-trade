@@ -188,3 +188,38 @@ async def test_cancelled_shutdown_records_reason(engine, tmp_path):
         await engine.run('markets.json')
     row = engine.db.conn.execute("SELECT data FROM bot_events WHERE event='安全停机开始'").fetchone()
     assert json.loads(row[0])['reason'] == '运行中断：CancelledError'
+
+
+async def test_account_queue_processed_first_and_market_backlog_is_bounded(engine):
+    seen = []
+    async def handle(kind, data):
+        seen.append(kind)
+        if kind == 'market':
+            engine.queue.put_nowait(('market', {}))
+    engine.on_message = handle
+    engine.user_queue.put_nowait(('account', {}))
+    engine.queue.put_nowait(('market', {}))
+    await engine.drain_messages()
+    assert seen[0] == 'account'
+    assert len(seen) <= 201
+    assert not engine.queue.empty()
+
+
+async def test_slow_clock_task_does_not_block_account_queue(engine):
+    import asyncio
+    entered = asyncio.Event()
+    async def slow_clock():
+        entered.set()
+        await asyncio.Event().wait()
+    engine.api.clock_checked = 0
+    engine.api.sync_clock = slow_clock
+    task = asyncio.create_task(engine.housekeeping())
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        engine.user_queue.put_nowait(('user_connected', {}))
+        await asyncio.wait_for(engine.drain_messages(), 1)
+        assert engine.reconcile_requested
+        assert not task.done()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

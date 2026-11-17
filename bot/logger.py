@@ -84,6 +84,12 @@ def simple_message(db, name, data, now):
         direction = next((k for k, v in r['market']['tokens'].items() if v == data.get('asset')), '?')
         fee_kind = "实际" if data.get('fee_kind') == 'actual' else "估算"
         return f"{'买入' if data['side'] == 'BUY' else '卖出'}成交 | {label} | {direction} | 价格 {data['price']} × {data['shares']} 份 | 手续费 {data['fee']}（{fee_kind}）"
+    if name == '止盈处理中':
+        return f"止盈处理中 | {label} | 待保护 {data.get('shares')} 份，正在核实可卖余额"
+    if name == '持仓暂不可挂止盈':
+        return f"止盈暂未挂出 | {label} | 可卖 {data.get('shares')} 份，账户余额 {data.get('balance', '?')} 份，最少 {data.get('min_size')} 份，授权 {'足够' if data.get('allowance_ok') else '不足'}"
+    if name == '止盈处理耗时':
+        return f"止盈处理返回 | {label} | 耗时 {data.get('milliseconds')} 毫秒（是否成功以挂单结果为准）"
     if name == "撤单已确认" and order and r:
         if order['side'] != 'BUY':
             return f"卖单撤销已确认 | {label} | {outcome}"

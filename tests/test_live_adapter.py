@@ -201,3 +201,16 @@ async def test_live_failure_distinguishes_before_and_after_submission(engine, af
     engine.broker = Broker()
     order = await engine.submit(engine.rounds["test-round"], "up", "BUY", "0.10", "10", "ENTRY")
     assert order["status"] == ("UNKNOWN" if after_send else "REJECTED")
+
+
+async def test_live_confirmed_fill_places_exit_before_manage_and_does_not_duplicate(engine):
+    order = await engine.submit(engine.rounds['test-round'], 'up', 'BUY', '0.10', '10', 'ENTRY')
+    engine.mode = 'live'
+    fill = asdict(Fill('priority', order['local_id'], '0.10', '10', '0', 'actual', engine.api.now(), 'MAKER'))
+    await engine.accept_fills([fill])
+    exits = [o for o in engine.orders.values() if o['side'] == 'SELL']
+    assert len(exits) == 1 and exits[0]['price'] == '0.20'
+    assert exits[0]['size'] == '10.00'
+    await engine.accept_fills([fill])
+    await engine.protect(engine.rounds['test-round'])
+    assert len([o for o in engine.orders.values() if o['side'] == 'SELL']) == 1

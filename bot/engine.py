@@ -38,6 +38,8 @@ class Engine:
         self.geo_allowed = mode == "paper"
         self.connection_reconciled = mode == "paper"
         self.queue = asyncio.Queue(maxsize=10000)
+        self.user_queue = asyncio.Queue(maxsize=10000)
+        self.reconcile_requested = False
         self.throttle = {}
         self.cancel_retries = {}
         self.recording = None
@@ -162,6 +164,7 @@ class Engine:
         return max(D(0), -net)
 
     async def accept_fills(self, fills):
+        protect_rounds = set()
         for f in fills:
             if f["id"] in self.fill_ids:
                 continue
@@ -172,6 +175,7 @@ class Engine:
             self.fills.append(f)
             if o["side"] == "BUY":
                 self.rounds[o["slug"]]["entry_closed"] = True
+                protect_rounds.add(o["slug"])
             confirmed = sum((D(x["shares"]) for x in self.fills if x["order_id"] == o["local_id"]), D(0))
             o["matched"] = str(max(confirmed, D(o.get("matched", "0"))))
             if confirmed >= D(o["size"]):
@@ -179,6 +183,10 @@ class Engine:
             self.save()
             self.emit("真实成交" if self.mode == "live" else "模拟成交", slug=o["slug"], side=o["side"], asset=o["asset_id"],
                       price=f["price"], shares=f["shares"], fee=f["fee"], fee_kind=f["fee_kind"], fill_id=f["id"])
+        if self.mode == "live":
+            # 确认成交后先保护库存，不等待队列中下一次全账户对账。
+            for slug in sorted(protect_rounds):
+                await self.protect(self.rounds[slug])
 
     async def reconcile(self):
         try:
@@ -330,7 +338,10 @@ class Engine:
                 self.limited("止盈重试暂停需检查", token, rejected=len(rejected))
                 continue
             try:
-                balance, allowed = await self.broker.available(token, m.version)
+                started = time.monotonic()
+                self.limited("止盈处理中", token, slug=m.slug, asset=token, shares=str(qty))
+                async with asyncio.timeout(6):
+                    balance, allowed = await self.broker.available(token, m.version)
                 qty = min(qty, max(D(0), balance - reserved)).quantize(D("0.01"), rounding=ROUND_DOWN)
                 b = self.feed.books.get(token)
                 if self.mode == "paper" and not b:
@@ -338,13 +349,15 @@ class Engine:
                 if b:
                     m.tick, m.min_size = b.tick, b.min_size
                 if not allowed or qty < D(m.min_size):
-                    self.limited("持仓暂不可挂止盈", token, shares=str(qty), min_size=m.min_size, allowance_ok=allowed)
+                    self.limited("持仓暂不可挂止盈", token, slug=m.slug, shares=str(qty), balance=str(balance),
+                                 min_size=m.min_size, allowance_ok=allowed)
                     continue
                 m.validate_order(rule.take_profit_price, qty)
                 r["market"] = asdict(m)
                 await self.submit(r, token, "SELL", rule.take_profit_price, qty, "TAKE_PROFIT")
+                self.emit("止盈处理耗时", slug=m.slug, asset=token, milliseconds=round((time.monotonic() - started) * 1000))
             except Exception as exc:
-                self.limited("止盈保护异常", token, error_type=type(exc).__name__)
+                self.limited("止盈保护异常", token, slug=m.slug, **error_fields(exc))
 
     async def manage(self):
         rules = {r.id: r for r in self.config.markets}
@@ -478,6 +491,8 @@ class Engine:
                     if o["asset_id"] == token and o["status"] in ACTIVE and D(o["price"]) % tick:
                         await self.cancel(o, "价格步长变更，原价格失效")
         elif kind == "discovered":
+            if self.stopping:
+                return
             rule, market = data
             latest = next((r for r in self.config.markets if r.id == rule.id and r.enabled), None)
             if latest and market and market.start > self.api.now():
@@ -495,12 +510,12 @@ class Engine:
                         o["matched"] = str(max(D(o.get("matched", "0")), p.size_matched))
                         if o["side"] == "BUY":
                             self.rounds[o["slug"]]["entry_closed"] = True
-            await self.reconcile()
+            self.reconcile_requested = True
         elif kind in {"user_connected", "user_disconnected"}:
             self.user_connected = kind == "user_connected"
             self.connection_reconciled = False
             self.emit(kind, **data)
-            await self.reconcile()
+            self.reconcile_requested = True
         elif kind == "feed_disconnected":
             self.emit("行情连接中断", **data)
             # 不盲目保留买入风险，退出仅撤本程序买单。
@@ -510,6 +525,39 @@ class Engine:
                     await self.cancel(o, "行情断线")
         elif kind == "feed_connected":
             self.emit("行情订阅连接成功", **data)
+
+    async def drain_messages(self):
+        # 账户消息独立排队，避免大量盘口更新饿死成交及止盈处理。
+        for _ in range(64):
+            if self.user_queue.empty():
+                break
+            kind, data = self.user_queue.get_nowait()
+            await self.on_message(kind, data)
+        started = time.monotonic()
+        for _ in range(200):
+            if self.queue.empty() or time.monotonic() - started > 0.05:
+                break
+            kind, data = self.queue.get_nowait()
+            await self.on_message(kind, data)
+
+    async def housekeeping(self):
+        while not self.stopping:
+            if time.time() - self.api.clock_checked > 60:
+                try:
+                    async with asyncio.timeout(15):
+                        await self.api.sync_clock()
+                except Exception as exc:
+                    self.limited("时钟同步失败", "clock", **error_fields(exc))
+            if self.mode == "live" and self.api.now() - self.last_geo > 300:
+                self.geo_allowed = False
+                try:
+                    async with asyncio.timeout(15):
+                        geo = await self.api.geoblock()
+                    self.geo_allowed = geo.get("blocked") is False
+                    self.last_geo = self.api.now()
+                except Exception as exc:
+                    self.limited("地区检查失败暂停新增买单", "geo", **error_fields(exc))
+            await asyncio.sleep(10)
 
     async def discover_loop(self):
         while not self.stopping:
@@ -529,6 +577,7 @@ class Engine:
     async def run(self, config_path, run_seconds=None):
         from .reporting import report
         discovery = asyncio.create_task(self.discover_loop())
+        housekeeping = asyncio.create_task(self.housekeeping())
         config_mtime = Path(config_path).stat().st_mtime_ns
         try:
             await self.reconcile()
@@ -549,22 +598,11 @@ class Engine:
                         except Exception as exc:
                             self.emit("配置无效保留原配置", "ERROR", error_type=type(exc).__name__)
                         config_mtime = mtime
-                    if time.time() - self.api.clock_checked > 60:
-                        try:
-                            await self.api.sync_clock()
-                        except Exception:
-                            self.limited("时钟同步失败", "clock")
-                    if self.mode == "live" and self.api.now() - self.last_geo > 300:
-                        self.geo_allowed = False
-                        geo = await self.api.geoblock()
-                        self.geo_allowed = geo.get("blocked") is False
-                        self.last_geo = self.api.now()
-                    while not self.queue.empty():
-                        kind, data = self.queue.get_nowait()
-                        await self.on_message(kind, data)
+                    await self.drain_messages()
                     tokens = {t for r in self.rounds.values() if r["status"] != "FINAL" and self.api.now() < r["market"]["end"] for t in r["market"]["tokens"].values()}
                     await self.feed.set_tokens(tokens)
-                    if self.api.now() - self.last_reconcile >= self.config.settings["reconcile_interval_seconds"]:
+                    if self.reconcile_requested or self.api.now() - self.last_reconcile >= self.config.settings["reconcile_interval_seconds"]:
+                        self.reconcile_requested = False
                         await self.reconcile()
                     await self.manage()
                     if self.api.now() - self.last_settlement >= 30:
@@ -587,7 +625,8 @@ class Engine:
         finally:
             self.stopping = True
             discovery.cancel()
-            await asyncio.gather(discovery, return_exceptions=True)
+            housekeeping.cancel()
+            await asyncio.gather(discovery, housekeeping, return_exceptions=True)
             self.emit("安全停机开始", reason=self.stop_reason)
             await self.reconcile()
             for o in list(self.orders.values()):
@@ -597,10 +636,7 @@ class Engine:
             stop_deadline = time.monotonic() + 15
             while any(o["side"] == "BUY" and o["status"] in ACTIVE for o in self.orders.values()) and time.monotonic() < stop_deadline:
                 await asyncio.sleep(0.5)
-                while not self.queue.empty():
-                    kind, data = self.queue.get_nowait()
-                    if kind != "discovered":
-                        await self.on_message(kind, data)
+                await self.drain_messages()
                 await self.reconcile()
                 for o in list(self.orders.values()):
                     if o["side"] == "BUY" and o["status"] in ACTIVE:
