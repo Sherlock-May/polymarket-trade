@@ -131,7 +131,7 @@ async def run(args, config):
             engine = None
             async def emit(kind, data):
                 await engine.queue.put((kind, data))
-            feed = MarketFeed(public, emit)
+            feed = MarketFeed(public, emit, immediate=mode == "live")
             try:
                 engine = Engine(db, config, api, feed, log, mode)
                 await api.sync_clock()

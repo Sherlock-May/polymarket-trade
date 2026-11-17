@@ -164,6 +164,7 @@ async def test_reconcile_recovers_null_expired_gtd_without_writing_exchange(engi
         async def get_balance_allowance(self, **kwargs):
             return NS(balance=0, allowances={})
     engine.broker = LiveBroker(engine, Client())
+    await engine.broker.reconcile(archived=True)
     await engine.reconcile()
     assert engine.connection_reconciled
     assert order["status"] == "EXPIRED" and engine.exposure() == 0

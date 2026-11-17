@@ -12,9 +12,9 @@ from pathlib import Path
 from .config import Config, Rule, D
 from .database import dumps
 from .logger import event, error_fields
-from .models import Market, utc_iso
+from .models import Book, Market, utc_iso
 from .pnl_calculator import position
-from .polymarket_client import ACTIVE, TERMINAL, PaperBroker
+from .polymarket_client import ACTIVE, TERMINAL, PaperBroker, LiveBroker
 
 
 class Engine:
@@ -192,7 +192,7 @@ class Engine:
     async def reconcile(self):
         try:
             async with asyncio.timeout(15):
-                fills = await self.broker.reconcile()
+                fills = await self.broker.reconcile(archived=False) if isinstance(self.broker, LiveBroker) else await self.broker.reconcile()
             await self.accept_fills(fills)
             for o in self.orders.values():
                 if o["side"] == "BUY" and D(o.get("matched", "0")) > 0:
@@ -292,6 +292,19 @@ class Engine:
                 raise ValueError("市场 WebSocket 未连接")
             for token in m.tokens.values():
                 b = self.feed.books.get(token)
+                if self.mode == "live" and (not b or not b.synced or time.time() - b.received_at > s["book_max_age_seconds"]):
+                    # 静默盘口可能没有推送；主动取完整快照，不能只放宽过期阈值。
+                    async with asyncio.timeout(4):
+                        raw = await self.api.book(token)
+                    b = Book.parse(raw, time.time())
+                    if (b.asset_id != token or not raw.get("tick_size") or not raw.get("min_order_size")
+                            or not isinstance(raw.get("bids"), list) or not isinstance(raw.get("asks"), list)):
+                        raise ValueError("盘口快照资产或交易规格不完整")
+                    current = self.feed.books.get(token)
+                    if current and current.timestamp > b.timestamp:
+                        b = current
+                    else:
+                        self.feed.books[token] = b
                 if not b or not b.synced or time.time() - b.received_at > s["book_max_age_seconds"]:
                     raise ValueError("等待新鲜完整盘口")
                 m.tick, m.min_size = b.tick, b.min_size
@@ -313,9 +326,10 @@ class Engine:
                 fresh = await self.api.market(m.slug)
                 if fresh.get("acceptingOrders") is not True or fresh.get("closed") is not False:
                     raise ValueError("提交前复查市场已不接受订单")
-        except (ValueError, KeyError) as exc:
-            r["skip_reason"] = str(exc)
-            self.limited("暂缓预挂", m.slug, reason=str(exc))
+        except Exception as exc:
+            reason = str(exc) if isinstance(exc, (ValueError, KeyError)) else type(exc).__name__
+            r["skip_reason"] = reason
+            self.limited("暂缓预挂", m.slug, reason=reason)
             return
         r["market"] = asdict(m)
         r["entry_attempted"], r["status"], r["skip_reason"] = True, "ACTIVE", ""
@@ -378,6 +392,11 @@ class Engine:
             m, now = r["market"], self.api.now()
             if r["status"] == "FINAL":
                 continue
+            if self.mode == "live" and now >= m["end"]:
+                # 历史轮次由独立任务对账、撤单及结算，不占用当前轮次下单路径。
+                r["entry_closed"] = True
+                r["status"] = "WAIT_SETTLEMENT"
+                continue
             enabled = rules.get(r["rule"]["id"])
             if enabled is None or not enabled.enabled or self.stopping:
                 r["entry_closed"] = True
@@ -404,11 +423,13 @@ class Engine:
 
     async def settle(self):
         import json
-        for slug, r in self.rounds.items():
+        for slug, r in list(self.rounds.items()):
             if self.api.now() < r["market"]["end"] or r["status"] == "FINAL":
                 continue
             local = [o for o in self.orders.values() if o["slug"] == slug]
             if any(o["status"] in ACTIVE for o in local):
+                continue
+            if any(o.get("trade_reconcile_required") for o in local):
                 continue
             if any(self.pending_inventory(token) > 0 for token in r["market"]["tokens"].values()):
                 continue
@@ -488,7 +509,8 @@ class Engine:
                             if data["payload"].get(key) is None:
                                 data["payload"][key] = r["market"][field]
                         break
-            self.feed.apply(data)
+            if not data.get("applied"):
+                self.feed.apply(data)
             if self.recording:
                 self.recording.write(dumps(data) + "\n")
                 self.recording.flush()
@@ -587,6 +609,22 @@ class Engine:
                     self.limited("地区检查失败暂停新增买单", "geo", **error_fields(exc))
             await asyncio.sleep(10)
 
+    async def archive_worker(self):
+        while not self.stopping:
+            try:
+                if isinstance(self.broker, LiveBroker):
+                    await self.accept_fills(await self.broker.reconcile(archived=True))
+                for o in list(self.orders.values()):
+                    if self.api.now() >= self.rounds[o["slug"]]["market"]["end"] and o["status"] in ACTIVE:
+                        await self.cancel(o, "历史轮次已结束")
+                await self.settle()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.limited("历史轮次核实失败", "archive", **error_fields(exc))
+            self.save()
+            await asyncio.sleep(30)
+
     async def discover_loop(self):
         while not self.stopping:
             for rule in list(self.config.markets):
@@ -607,6 +645,7 @@ class Engine:
         discovery = asyncio.create_task(self.discover_loop())
         housekeeping = asyncio.create_task(self.housekeeping())
         account_worker = asyncio.create_task(self.account_worker())
+        archive_worker = asyncio.create_task(self.archive_worker()) if self.mode == "live" else None
         config_mtime = Path(config_path).stat().st_mtime_ns
         try:
             await self.reconcile()
@@ -629,12 +668,14 @@ class Engine:
                         config_mtime = mtime
                     await self.drain_messages()
                     tokens = {t for r in self.rounds.values() if r["status"] != "FINAL" and self.api.now() < r["market"]["end"] for t in r["market"]["tokens"].values()}
+                    self.feed.specs = {t: {"tick_size": r["market"]["tick"], "min_order_size": r["market"]["min_size"]}
+                                       for r in self.rounds.values() for t in r["market"]["tokens"].values() if t in tokens}
                     await self.feed.set_tokens(tokens)
                     if self.reconcile_requested or self.api.now() - self.last_reconcile >= self.config.settings["reconcile_interval_seconds"]:
                         self.reconcile_requested = False
                         await self.reconcile()
                     await self.manage()
-                    if self.api.now() - self.last_settlement >= 30:
+                    if self.mode != "live" and self.api.now() - self.last_settlement >= 30:
                         try:
                             await self.settle()
                         except Exception as exc:
@@ -656,6 +697,9 @@ class Engine:
             discovery.cancel()
             housekeeping.cancel()
             account_worker.cancel()
+            if archive_worker:
+                archive_worker.cancel()
+                await asyncio.gather(archive_worker, return_exceptions=True)
             await asyncio.gather(discovery, housekeeping, account_worker, return_exceptions=True)
             self.emit("安全停机开始", reason=self.stop_reason)
             await self.reconcile()

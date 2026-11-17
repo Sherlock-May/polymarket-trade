@@ -19,9 +19,11 @@ def plain(obj):
 
 class MarketFeed:
     """官方 SDK 负责协议订阅、心跳、重连；连接重建后等待完整 book 快照。"""
-    def __init__(self, client, emit):
+    def __init__(self, client, emit, immediate=False):
         self.client, self.emit = client, emit
+        self.immediate = immediate
         self.books = {}
+        self.specs = {}
         self.tokens = set()
         self.task = None
         self.seen = OrderedDict()
@@ -67,7 +69,12 @@ class MarketFeed:
                         self.seen[key] = None
                         if len(self.seen) > 5000:
                             self.seen.popitem(last=False)
-                        await self.emit("market_message", {"type": kind, "payload": payload, "timestamp": ts, "received_at": received})
+                        message = {"type": kind, "payload": payload, "timestamp": ts, "received_at": received}
+                        # 在接收任务更新盘口，不等待交易主循环中的网络请求。
+                        if self.immediate:
+                            self.apply(message)
+                            message["applied"] = True
+                        await self.emit("market_message", message)
                         delay = 1
             except asyncio.CancelledError:
                 raise
@@ -85,7 +92,11 @@ class MarketFeed:
             old = self.books.get(token)
             if old and ts < old.timestamp:
                 return
-            self.books[token] = Book.parse({**p, "asset_id": token, "timestamp": ts * 1000}, received)
+            raw = {**p, "asset_id": token, "timestamp": ts * 1000}
+            for key, value in self.specs.get(token, {}).items():
+                if raw.get(key) is None:
+                    raw[key] = value
+            self.books[token] = Book.parse(raw, received)
         elif kind == "price_change":
             for change in p.get("price_changes", []):
                 token = str(change.get("asset_id", change.get("token_id", "")))

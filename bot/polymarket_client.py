@@ -193,9 +193,21 @@ class LiveBroker:
     async def cancel(self, order):
         if not order.get("exchange_id"):
             return False
-        await self.client.cancel_order(order_id=order["exchange_id"])
+        response = await self.client.cancel_order(order_id=order["exchange_id"])
+        acknowledged = order["exchange_id"] in {str(x) for x in getattr(response, "canceled", [])}
+        if acknowledged:
+            order["cancel_acknowledged"] = True
+            order["cancel_acknowledged_at"] = self.engine.api.now()
         # 取消响应不代替最终状态查询；成交仍由 trades 记录确认。
-        final = await self._get_order(order["exchange_id"])
+        try:
+            final = await self._get_order(order["exchange_id"])
+        except OrderUnavailableError:
+            # 明确的撤单回执可证明剩余挂单已撤；不能据此推断没有成交。
+            if order.get("cancel_acknowledged"):
+                order["status_source"] = "cancel_acknowledged_detail_unavailable"
+                order["trade_reconcile_required"] = True
+                return True
+            raise
         order["matched"] = str(final.size_matched)
         status = final.status.upper()
         if status == "EXPIRED":
@@ -224,80 +236,115 @@ class LiveBroker:
                                     liquidity, tx_hash=str(trade.transaction_hash or ''))))
         return fills
 
-    async def reconcile(self):
+    async def reconcile(self, archived=None):
         fills = []
-        for r in self.engine.rounds.values():
+        # 已结束的轮次独立处理；旧单详情不可用不能饿死当前成交查询。
+        for r in list(self.engine.rounds.values()):
             if r["status"] == "FINAL":
                 continue
-            slug = r["market"]["slug"]
-            local = [o for o in self.engine.orders.values() if o["slug"] == slug]
+            ended = self.engine.api.now() >= r["market"]["end"]
+            if archived is not None and ended != archived:
+                continue
+            local = [o for o in list(self.engine.orders.values()) if o["slug"] == r["market"]["slug"]]
             if not local:
                 continue
-            opened = [o async for o in self.client.list_open_orders(market=r["market"]["condition_id"]).iter_items()]
-            trades = [t async for t in self.client.list_account_trades(market=r["market"]["condition_id"]).iter_items()]
-            for o in local:
-                if o["status"] in {"INTENT", "UNKNOWN", "CANCEL_PENDING"} and not o.get("exchange_id"):
-                    # 不确定的提交只认领唯一匹配；没有证据时保持 UNKNOWN，禁止补发。
-                    candidates = [x for x in opened if str(x.asset_id) == o["asset_id"] and x.side == o["side"] and x.price == D(o["price"]) and x.original_size == D(o["size"]) and abs(x.created_at.timestamp() - o["created_at"]) < 120]
-                    if len(candidates) == 1:
-                        o["exchange_id"], o["status"] = str(candidates[0].id), "LIVE"
-                    elif not candidates:
-                        # 订单可能在响应丢失前已完全成交，因而不在 open_orders。
-                        # 从同市场成交提取候选 ID，再查最终订单验证原始数量/方向/时间。
-                        ids = set()
-                        for t in trades:
-                            matched_at = getattr(t, "matched_at", None)
-                            if matched_at is None or abs(matched_at.timestamp() - o["created_at"]) >= 120:
-                                continue
-                            if str(getattr(t, "asset_id", "")) == o["asset_id"]:
-                                ids.add(str(t.taker_order_id))
-                            for maker in t.maker_orders:
-                                if str(maker.asset_id) == o["asset_id"]:
-                                    ids.add(str(maker.order_id))
-                        owned = {x.get("exchange_id") for x in self.engine.orders.values() if x is not o}
-                        verified = []
-                        for ident in ids - owned:
-                            try:
-                                remote = await self._get_order(ident)
-                            except Exception:
-                                continue
-                            if str(remote.asset_id) == o["asset_id"] and remote.side == o["side"] and remote.price == D(o["price"]) and remote.original_size == D(o["size"]) and abs(remote.created_at.timestamp() - o["created_at"]) < 120:
-                                verified.append(remote)
-                        if len(verified) == 1:
-                            o["exchange_id"], o["status"] = str(verified[0].id), "LIVE"
-                if o.get("exchange_id") and o["status"] in ACTIVE:
-                    try:
-                        remote = await self._get_order(o["exchange_id"])
-                    except OrderUnavailableError:
-                        if await self._expired_without_inventory(o, r, opened, trades):
+            try:
+                async with asyncio.timeout(6 if ended else 10):
+                    batch = await self._reconcile_round(r, local)
+                fills.extend(batch)
+                if self.engine.mode == "live":
+                    await self.engine.accept_fills(batch)
+            except Exception as exc:
+                if not ended:
+                    raise
+                self.engine.limited("历史轮次核实失败", r["market"]["slug"], error_type=type(exc).__name__)
+        return fills
+
+    async def _reconcile_round(self, r, local):
+        fills = []
+        opened = [o async for o in self.client.list_open_orders(market=r["market"]["condition_id"]).iter_items()]
+        trades = [t async for t in self.client.list_account_trades(market=r["market"]["condition_id"]).iter_items()]
+        for o in local:
+            if o["status"] in {"INTENT", "UNKNOWN", "CANCEL_PENDING"} and not o.get("exchange_id"):
+                # 不确定的提交只认领唯一匹配；没有证据时保持 UNKNOWN，禁止补发。
+                candidates = [x for x in opened if str(x.asset_id) == o["asset_id"] and x.side == o["side"] and x.price == D(o["price"]) and x.original_size == D(o["size"]) and abs(x.created_at.timestamp() - o["created_at"]) < 120]
+                if len(candidates) == 1:
+                    o["exchange_id"], o["status"] = str(candidates[0].id), "LIVE"
+                elif not candidates:
+                    # 订单可能在响应丢失前已完全成交，因而不在 open_orders。
+                    # 从同市场成交提取候选 ID，再查最终订单验证原始数量/方向/时间。
+                    ids = set()
+                    for t in trades:
+                        matched_at = getattr(t, "matched_at", None)
+                        if matched_at is None or abs(matched_at.timestamp() - o["created_at"]) >= 120:
                             continue
-                        self.engine.limited("旧订单详情不可用继续核实", o["local_id"])
+                        if str(getattr(t, "asset_id", "")) == o["asset_id"]:
+                            ids.add(str(t.taker_order_id))
+                        for maker in t.maker_orders:
+                            if str(maker.asset_id) == o["asset_id"]:
+                                ids.add(str(maker.order_id))
+                    owned = {x.get("exchange_id") for x in self.engine.orders.values() if x is not o}
+                    verified = []
+                    for ident in ids - owned:
+                        try:
+                            remote = await self._get_order(ident)
+                        except Exception:
+                            continue
+                        if str(remote.asset_id) == o["asset_id"] and remote.side == o["side"] and remote.price == D(o["price"]) and remote.original_size == D(o["size"]) and abs(remote.created_at.timestamp() - o["created_at"]) < 120:
+                            verified.append(remote)
+                    if len(verified) == 1:
+                        o["exchange_id"], o["status"] = str(verified[0].id), "LIVE"
+            if o.get("exchange_id") and o["status"] in ACTIVE:
+                try:
+                    remote = await self._get_order(o["exchange_id"])
+                except OrderUnavailableError:
+                    if await self._expired_without_inventory(o, r, opened, trades):
                         continue
-                    o["matched"] = str(remote.size_matched)
-                    if remote.size_matched >= remote.original_size:
-                        o["status"] = "FILLED"
-                    elif remote.status.upper() in {"CANCELED", "CANCELLED"}:
-                        o["status"] = "CANCELED"
-                        self.engine.emit("撤单已确认", order=o["local_id"], matched=o.get("matched", "0"))
-                    elif remote.status.upper() == "EXPIRED":
-                        o["status"] = "EXPIRED"
-                    elif remote.size_matched > 0:
-                        o["status"] = "PARTIAL"
-            for trade in trades:
-                # 即使尚未 CONFIRMED，也立即阻止本轮新买单并撤销剩余买单。
-                known = {o.get("exchange_id"): o for o in local if o.get("exchange_id")}
-                legs = []
-                if str(trade.taker_order_id) in known:
-                    legs.append((known[str(trade.taker_order_id)], trade.price, trade.size, "TAKER"))
-                for maker in trade.maker_orders:
-                    if str(maker.order_id) in known:
-                        legs.append((known[str(maker.order_id)], maker.price, maker.matched_amount, "MAKER"))
-                for o, price, size, liquidity in legs:
-                    if trade.status not in {"FAILED"} and o["side"] == "BUY":
-                        r["entry_closed"] = True
-                    if trade.status != "CONFIRMED":
-                        continue
-                fills.extend(self.trade_fills(trade, local))
+                    if (o["side"] == "SELL" and self.engine.api.now() > r["market"]["end"] + 60
+                            and not any(str(x.id) == o["exchange_id"] for x in opened)):
+                        raw = await self.engine.api.market(r["market"]["slug"])
+                        if raw.get("closed") is True and raw.get("umaResolutionStatus") == "resolved":
+                            o["status"] = "CANCELED"
+                            o["status_source"] = "resolved_market_no_open_order"
+                            o["trade_reconcile_required"] = True
+                            self.engine.emit("旧止盈单已结束", order=o["local_id"], basis="市场已最终结算且挂单列表无此订单；成交单独核算")
+                            continue
+                    self.engine.limited("旧订单详情不可用继续核实", o["local_id"])
+                    continue
+                o["matched"] = str(remote.size_matched)
+                if remote.size_matched >= remote.original_size:
+                    o["status"] = "FILLED"
+                elif remote.status.upper() in {"CANCELED", "CANCELLED"}:
+                    o["status"] = "CANCELED"
+                    self.engine.emit("撤单已确认", order=o["local_id"], matched=o.get("matched", "0"))
+                elif remote.status.upper() == "EXPIRED":
+                    o["status"] = "EXPIRED"
+                elif remote.size_matched > 0:
+                    o["status"] = "PARTIAL"
+        for trade in trades:
+            # 即使尚未 CONFIRMED，也立即阻止本轮新买单并撤销剩余买单。
+            known = {o.get("exchange_id"): o for o in local if o.get("exchange_id")}
+            legs = []
+            if str(trade.taker_order_id) in known:
+                legs.append((known[str(trade.taker_order_id)], trade.price, trade.size, "TAKER"))
+            for maker in trade.maker_orders:
+                if str(maker.order_id) in known:
+                    legs.append((known[str(maker.order_id)], maker.price, maker.matched_amount, "MAKER"))
+            for o, price, size, liquidity in legs:
+                if trade.status not in {"FAILED"} and o["side"] == "BUY":
+                    r["entry_closed"] = True
+                if trade.status != "CONFIRMED":
+                    continue
+            fills.extend(self.trade_fills(trade, local))
+        for o in local:
+            if not o.get("trade_reconcile_required"):
+                continue
+            related = [t for t in trades if str(t.taker_order_id) == o.get("exchange_id")
+                       or any(str(m.order_id) == o.get("exchange_id") for m in (t.maker_orders or []))]
+            pending = any(t.status not in {"CONFIRMED", "FAILED"} for t in related)
+            # 撤单回执后的成交可能稍迟可见；保留一轮宽限期，不提前结算盈亏。
+            if not pending and self.engine.api.now() >= o.get("cancel_acknowledged_at", 0) + 60:
+                o["trade_reconcile_required"] = False
         return fills
 
     async def close(self):
