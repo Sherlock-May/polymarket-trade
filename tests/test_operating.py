@@ -156,3 +156,35 @@ async def test_reconcile_command_backs_up_and_only_reads_account(engine, tmp_pat
     assert restored.meta("preserved") == "history"
     restored.close()
     assert calls == ["clock", "read_account", "report", "close", "close"]
+
+
+async def test_timed_shutdown_records_reason(engine, tmp_path):
+    engine.started_at -= 10
+    engine.report_directory = tmp_path / 'report'
+    async def discovery():
+        return
+    engine.discover_loop = discovery
+    await engine.run('markets.json', run_seconds=1)
+    row = engine.db.conn.execute("SELECT data FROM bot_events WHERE event='安全停机开始'").fetchone()
+    assert json.loads(row[0])['reason'] == '达到限定运行时间'
+
+
+async def test_cancelled_shutdown_records_reason(engine, tmp_path):
+    import asyncio
+    engine.report_directory = tmp_path / 'report'
+    async def discovery():
+        return
+    engine.discover_loop = discovery
+    original = engine.reconcile
+    calls = 0
+    async def cancel_once():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise asyncio.CancelledError()
+        await original()
+    engine.reconcile = cancel_once
+    with pytest.raises(asyncio.CancelledError):
+        await engine.run('markets.json')
+    row = engine.db.conn.execute("SELECT data FROM bot_events WHERE event='安全停机开始'").fetchone()
+    assert json.loads(row[0])['reason'] == '运行中断：CancelledError'

@@ -70,7 +70,10 @@ def simple_message(db, name, data, now):
     label = f"{r['rule']['id'].upper()} {_local_time(r['market']['start'])} 开盘" if r else str(slug or "")
     outcome = next((k for k, v in r["market"]["tokens"].items() if order and v == order["asset_id"]), "") if r else ""
     if name in {"程序启动", "配置已热更新"}:
-        return "启用市场：" + (", ".join(data.get("enabled", [])) or "无") + f" | 模式：{data.get('mode')}"
+        message = "启用市场：" + (", ".join(data.get("enabled", [])) or "无") + f" | 模式：{data.get('mode')}"
+        if name == "程序启动":
+            message += f" | PID {data.get('pid', '?')} | 停机诊断 v{data.get('stop_debug_version', 1)} | 限时 {data.get('run_seconds') or '无'}"
+        return message
     if name == "发现下一轮市场" and r:
         return f"发现下一轮 | {label}，{_local_time(r['market']['end'])} 结束 | 买单截止 {_local_time(r['deadline'])}"
     if name in {"订单被接受", "订单被拒绝", "订单未发送", "提交结果未知禁止重复下单"} and order:

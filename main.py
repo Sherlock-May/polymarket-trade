@@ -155,7 +155,9 @@ async def run(args, config):
                         signal.signal(sig, request_stop)
                     except ValueError:
                         pass
-                engine.emit("程序启动", enabled=[r.id for r in config.markets if r.enabled], database=db_path)
+                engine.emit("程序启动", enabled=[r.id for r in config.markets if r.enabled], database=db_path,
+                            pid=os.getpid(), parent_pid=os.getppid(), run_seconds=args.seconds,
+                            stop_debug_version=2)
                 await engine.run(args.config, args.seconds)
             finally:
                 if user_task:
