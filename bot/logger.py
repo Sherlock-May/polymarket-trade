@@ -45,7 +45,7 @@ def setup(mode):
     simple.propagate = False
     simple.setLevel(logging.INFO)
     if not simple.handlers:
-        for handler in (logging.StreamHandler(), RotatingFileHandler(f"logs/{mode}-简洁.log", maxBytes=10_000_000, backupCount=10, encoding="utf-8")):
+        for handler in (logging.StreamHandler(), RotatingFileHandler(f"logs/{mode}-simple.log", maxBytes=10_000_000, backupCount=10, encoding="utf-8")):
             handler.setFormatter(ZonedFormatter("[%(asctime)s] %(message)s"))
             simple.addHandler(handler)
     # SDK/httpx 请求日志可能含签名查询参数；禁止开启底层调试日志。
