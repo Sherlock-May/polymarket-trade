@@ -5,6 +5,7 @@ import json
 import time
 from collections import OrderedDict
 from dataclasses import asdict, is_dataclass
+from types import SimpleNamespace
 from .config import D
 from .models import Book
 
@@ -131,7 +132,7 @@ async def user_feed(client, queue):
                 await queue.put(("user_connected", {}))
                 async for update in stream:
                     # 不把包含 owner/API key 的原始事件写日志或行情文件。
-                    await queue.put(("user_update", update))
+                    await queue.put(("user_update", SimpleNamespace(type=update.type, payload=update.payload, received_at=time.time())))
                     delay = 1
         except asyncio.CancelledError:
             raise

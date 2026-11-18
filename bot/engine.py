@@ -41,6 +41,8 @@ class Engine:
         self.user_queue = asyncio.Queue(maxsize=10000)
         self.reconcile_requested = False
         self.protect_locks = {}
+        self.fast_protect_tasks = {}
+        self.deferred_sell_fills = {}
         self.throttle = {}
         self.cancel_retries = {}
         self.recording = None
@@ -141,7 +143,7 @@ class Engine:
         today = datetime.fromtimestamp(self.api.now(), timezone.utc).date()
         net = D(0)
         inventory = {}
-        for f in sorted(self.fills, key=lambda x: (x["timestamp"], x["id"])):
+        for f in sorted(self.fills, key=lambda x: (x["timestamp"], self.orders[x['order_id']]['side'] != 'BUY', x["id"])):
             o = self.orders[f["order_id"]]
             key = (o["slug"], o["asset_id"])
             qty, cost = inventory.get(key, (D(0), D(0)))
@@ -164,12 +166,20 @@ class Engine:
                     net -= D(p["cost"])
         return max(D(0), -net)
 
-    async def accept_fills(self, fills):
+    async def accept_fills(self, fills, background=False):
         protect_rounds = set()
-        for f in fills:
+        candidates = {**self.deferred_sell_fills, **{f['id']: f for f in fills}}
+        self.deferred_sell_fills = {}
+        for f in sorted(candidates.values(), key=lambda f: (self.orders[f['order_id']]['side'] != 'BUY', f['timestamp'], f['id'])):
             if f["id"] in self.fill_ids:
                 continue
             o = self.orders[f["order_id"]]
+            if o['side'] == 'SELL' and D(f['shares']) > D(self.position(o['slug'], o['asset_id'])['shares']):
+                # 提前挂出的卖单确认可能先到；等买入确认再记收益，REST 会补查。
+                self.deferred_sell_fills[f['id']] = f
+                self.reconcile_requested = True
+                self.limited('卖出确认等待买入对账', o['local_id'], order=o['local_id'])
+                continue
             if (o["side"] == "BUY" and D(f["price"]) > D(o["price"])) or (o["side"] == "SELL" and D(f["price"]) < D(o["price"])):
                 raise ValueError("成交价格越过限价，停止新增订单并要求对账")
             self.fill_ids.add(f["id"])
@@ -187,7 +197,11 @@ class Engine:
         if self.mode == "live":
             # 确认成交后先保护库存，不等待队列中下一次全账户对账。
             for slug in sorted(protect_rounds):
-                await self.protect(self.rounds[slug])
+                task = self.fast_protect_tasks.get(slug)
+                if background:
+                    self.request_fast_protection(slug)
+                elif not task or task.done():
+                    await self.protect(self.rounds[slug])
 
     async def reconcile(self):
         try:
@@ -349,12 +363,79 @@ class Engine:
         async with lock:
             await self._protect(r)
 
+    def unconfirmed_buy_shares(self, slug, token):
+        pending = D(0)
+        for o in self.orders.values():
+            if o['slug'] != slug or o['asset_id'] != token or o['side'] != 'BUY':
+                continue
+            matched = sum((D(t['shares']) for t in o.get('early_matches', {}).values() if t['status'] != 'FAILED'), D(0))
+            confirmed = sum((D(f['shares']) for f in self.fills if f['order_id'] == o['local_id']), D(0))
+            pending += max(D(0), min(D(o['size']), matched) - confirmed)
+        return pending
+
+    def request_fast_protection(self, slug):
+        task = self.fast_protect_tasks.get(slug)
+        if self.stopping or (task and not task.done()):
+            return
+        self.fast_protect_tasks[slug] = asyncio.create_task(self.fast_protect(slug))
+
+    async def fast_protect(self, slug):
+        r = self.rounds[slug]
+        until = time.monotonic() + 30
+        try:
+            while not self.stopping and self.api.now() < r['market']['end'] and time.monotonic() < until:
+                await self.protect(r)
+                if all(D(self.position(slug, t)['shares']) + self.unconfirmed_buy_shares(slug, t)
+                       - self.reserved('SELL', t) < D(r['market']['min_size']) for t in r['market']['tokens'].values()):
+                    return
+                await asyncio.sleep(.25)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.limited('止盈保护异常', slug, slug=slug, **error_fields(exc))
+
+    def observe_matched_trade(self, trade, local, received_at=None):
+        if self.mode != 'live' or trade.status not in {'MATCHED', 'MINED', 'RETRYING', 'CONFIRMED', 'FAILED'}:
+            return
+        legs = [(str(trade.taker_order_id), trade.price, trade.size)] if any(o.get('exchange_id') == str(trade.taker_order_id) for o in local) else []
+        legs += [(str(m.order_id), m.price, m.matched_amount) for m in (trade.maker_orders or [])]
+        for ident, price, size in legs:
+            for o in local:
+                if o.get('exchange_id') != ident or o['side'] != 'BUY':
+                    continue
+                entries = o.setdefault('early_matches', {})
+                old = entries.get(str(trade.id))
+                if old and old['status'] in {'CONFIRMED', 'FAILED'}:
+                    continue
+                if D(size) <= 0 or D(size) > D(o['size']):
+                    continue
+                if not 0 < D(price) <= D(o['price']):
+                    raise ValueError('买入撮合通知越过限价，要求对账')
+                entries[str(trade.id)] = {'shares': str(size), 'status': trade.status}
+                self.rounds[o['slug']]['entry_closed'] = True
+                pending = sum((D(t['shares']) for t in entries.values() if t['status'] != 'FAILED'), D(0))
+                o['matched'] = str(max(D(o.get('matched', '0')), min(D(o['size']), pending)))
+                stamp = getattr(trade, 'matched_at', None)
+                if stamp and 'first_match_at' not in o:
+                    o['first_match_at'] = stamp.timestamp()
+                    o['first_match_received_at'] = received_at
+                self.db.put_order(o)
+                self.limited('收到撮合通知立即检查止盈', o['local_id'], order=o['local_id'], slug=o['slug'],
+                             status=trade.status, matched_at=stamp.timestamp() if stamp else None,
+                             received_at=received_at, processed_at=time.time(), source='websocket' if received_at is not None else 'rest')
+                if trade.status == 'FAILED':
+                    self.emit('撮合失败需核实持仓', 'ERROR', order=o['local_id'], slug=o['slug'])
+                else:
+                    self.request_fast_protection(o['slug'])
+
     async def _protect(self, r):
         m, rule = self.market(r["market"]["slug"]), Rule(**r["rule"])
         if self.api.now() >= m.end or r.get("settlement"):
             return
         for token in m.tokens.values():
             own = D(self.position(m.slug, token)["shares"])
+            if self.mode == 'live':
+                own += self.unconfirmed_buy_shares(m.slug, token)
             reserved = self.reserved("SELL", token)
             qty = max(D(0), own - reserved)
             if qty <= 0:
@@ -381,7 +462,14 @@ class Engine:
                     continue
                 m.validate_order(rule.take_profit_price, qty)
                 r["market"] = asdict(m)
-                await self.submit(r, token, "SELL", rule.take_profit_price, qty, "TAKE_PROFIT")
+                exit_order = await self.submit(r, token, "SELL", rule.take_profit_price, qty, "TAKE_PROFIT")
+                buys = [o for o in self.orders.values() if o['slug'] == m.slug and o['asset_id'] == token
+                        and o['side'] == 'BUY' and o.get('first_match_at') is not None]
+                if buys:
+                    first = min(buys, key=lambda o: o['first_match_at'])
+                    self.emit('撮合到止盈提交结果', slug=m.slug, order=exit_order['local_id'], status=exit_order['status'],
+                              matched_at=first['first_match_at'], received_at=first.get('first_match_received_at'),
+                              result_at=time.time(), elapsed_ms=round((self.api.now() - first['first_match_at']) * 1000))
                 self.emit("止盈处理耗时", slug=m.slug, asset=token, milliseconds=round((time.monotonic() - started) * 1000))
             except Exception as exc:
                 self.limited("止盈保护异常", token, slug=m.slug, **error_fields(exc))
@@ -534,13 +622,15 @@ class Engine:
                 self.add_round(market, latest)
         elif kind == "user_update":
             p = data.payload
+            if data.type == 'trade':
+                self.observe_matched_trade(p, list(self.orders.values()), getattr(data, 'received_at', None))
             if data.type == "trade" and p.status != "FAILED":
                 ids = {str(p.taker_order_id)} | {str(x.order_id) for x in (p.maker_orders or [])}
                 for o in self.orders.values():
                     if o.get("exchange_id") in ids and o["side"] == "BUY":
                         self.rounds[o["slug"]]["entry_closed"] = True
                 if p.status == 'CONFIRMED' and hasattr(self.broker, 'trade_fills'):
-                    await self.accept_fills(self.broker.trade_fills(p, list(self.orders.values())))
+                    await self.accept_fills(self.broker.trade_fills(p, list(self.orders.values())), background=True)
             elif data.type == "order" and p.size_matched > 0:
                 for o in self.orders.values():
                     if o.get("exchange_id") == str(p.id):
@@ -732,6 +822,9 @@ class Engine:
             discovery.cancel()
             housekeeping.cancel()
             account_worker.cancel()
+            for task in self.fast_protect_tasks.values():
+                task.cancel()
+            await asyncio.gather(*self.fast_protect_tasks.values(), return_exceptions=True)
             if archive_worker:
                 archive_worker.cancel()
                 await asyncio.gather(archive_worker, return_exceptions=True)

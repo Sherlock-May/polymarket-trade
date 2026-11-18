@@ -14,7 +14,8 @@ def estimate_fee(market, price, shares, liquidity):
 def position(fills, order_map, slug, token):
     qty, cost, proceeds, fees, realized = D(0), D(0), D(0), D(0), D(0)
     estimated = False
-    for f in sorted(fills, key=lambda x: (x["timestamp"], x["id"])):
+    # 平台时间可能只有整秒；同秒买卖先计买入，避免快速止盈被误判为超卖。
+    for f in sorted(fills, key=lambda x: (x["timestamp"], order_map[x['order_id']]['side'] != 'BUY', x["id"])):
         o = order_map[f["order_id"]]
         if o["slug"] != slug or o["asset_id"] != token or f.get("status") != "CONFIRMED":
             continue

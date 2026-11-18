@@ -97,6 +97,13 @@ def simple_message(db, name, data, now):
         return f"旧止盈单已结束 | {label} | 市场已结算且无活动挂单，收益以成交及结算记录为准"
     if name == '恢复待预挂轮次':
         return f"恢复待预挂 | {label} | 上次退出前未下过单，重新等待预挂检查"
+    if name == '收到撮合通知立即检查止盈':
+        matched = _local_time(data['matched_at']) if data.get('matched_at') else '未提供'
+        return f"收到撮合通知 | {label} | 订单 {order_id} | 状态 {data.get('status')} | 实际撮合 {matched} | 已触发可卖余额检查，尚不代表止盈成功"
+    if name == '撮合失败需核实持仓':
+        return f"撮合失败需核实持仓 | {label} | 订单 {order_id}"
+    if name == '撮合到止盈提交结果':
+        return f"撮合到止盈提交结果 | {label} | 止盈订单 {order_id} | 状态 {data.get('status')} | 自撮合约 {data.get('elapsed_ms')} 毫秒（含平台通知和余额等待）"
     if name == '持仓暂不可挂止盈':
         return f"止盈暂未挂出 | {label} | 可卖 {data.get('shares')} 份，账户余额 {data.get('balance', '?')} 份，最少 {data.get('min_size')} 份，授权 {'足够' if data.get('allowance_ok') else '不足'}"
     if name == '止盈处理耗时':
@@ -162,6 +169,6 @@ def trade_message(db, name, data, message):
     if order and order['purpose'] == 'TAKE_PROFIT' and name in {'订单被接受', '订单被拒绝', '订单未发送', '提交结果未知禁止重复下单', '撤单已确认'}:
         buys = [o['local_id'] for o in db.orders() if o['slug'] == order['slug'] and o['asset_id'] == order['asset_id'] and o['side'] == 'BUY']
         return f"{message} | 止盈订单 {order_id} | 对应买单 {','.join(buys)}"
-    if name in {'止盈处理中', '持仓暂不可挂止盈', '止盈保护异常', '止盈处理耗时', '止盈重试暂停需检查', '最终结算已确认'}:
+    if name in {'撮合到止盈提交结果', '收到撮合通知立即检查止盈', '撮合失败需核实持仓', '止盈处理中', '持仓暂不可挂止盈', '止盈保护异常', '止盈处理耗时', '止盈重试暂停需检查', '最终结算已确认'}:
         return message
     return None

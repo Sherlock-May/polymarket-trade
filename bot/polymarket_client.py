@@ -264,6 +264,9 @@ class LiveBroker:
         fills = []
         opened = [o async for o in self.client.list_open_orders(market=r["market"]["condition_id"]).iter_items()]
         trades = [t async for t in self.client.list_account_trades(market=r["market"]["condition_id"]).iter_items()]
+        # 先交付撮合通知，不等待逐笔订单详情请求结束。
+        for trade in trades:
+            self.engine.observe_matched_trade(trade, local)
         for o in local:
             if o["status"] in {"INTENT", "UNKNOWN", "CANCEL_PENDING"} and not o.get("exchange_id"):
                 # 不确定的提交只认领唯一匹配；没有证据时保持 UNKNOWN，禁止补发。

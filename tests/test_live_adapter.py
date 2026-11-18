@@ -238,12 +238,14 @@ async def test_authenticated_push_can_protect_without_full_rest_reconcile(engine
     event = NS(type='trade', payload=trade)
     await engine.on_message('user_update', event)
     await engine.on_message('user_update', event)
+    import asyncio
+    await asyncio.gather(*engine.fast_protect_tasks.values())
     if status == 'CONFIRMED':
         assert posts == ['signed-exit']
         await engine.accept_fills(engine.broker.trade_fills(trade, list(engine.orders.values())))
         assert posts == ['signed-exit'] and len(engine.fills) == 1
     else:
-        assert posts == [] and engine.fills == []
+        assert posts == ['signed-exit'] and engine.fills == []
 
 
 async def test_concurrent_exit_checks_cannot_reserve_same_inventory(engine):
