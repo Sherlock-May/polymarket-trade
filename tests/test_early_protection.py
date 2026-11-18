@@ -77,6 +77,27 @@ async def test_partial_matches_combine_without_duplicate_inventory(engine):
     assert engine.fills == []
 
 
+async def test_live_buy_remainder_is_kept_until_cumulative_matches_reach_market_minimum(engine):
+    buy, posts = await setup_live(engine, [6000000])
+    canceled = []
+    async def cancel(order):
+        canceled.append(order["local_id"])
+        return True
+    engine.broker.cancel = cancel
+    engine.feed.books['up'].min_size = '6'
+
+    await engine.on_message('user_update', event(engine, 'first', '5'))
+    await engine.manage()
+    assert canceled == [] and posts == []
+
+    await engine.on_message('user_update', event(engine, 'second', '1'))
+    await finish(engine)
+    await engine.manage()
+    assert canceled == [buy["local_id"]]
+    assert len(posts) == 1 and posts[0]['size'] == D(6)
+    assert engine.fills == []
+
+
 @pytest.mark.parametrize('delay', [0, 1])
 async def test_early_exit_confirmation_waits_for_buy_accounting(engine, delay):
     buy, posts = await setup_live(engine, [10000000])

@@ -325,7 +325,7 @@ class LiveBroker:
                 elif remote.size_matched > 0:
                     o["status"] = "PARTIAL"
         for trade in trades:
-            # 即使尚未 CONFIRMED，也立即阻止本轮新买单并撤销剩余买单。
+            # 即使尚未 CONFIRMED，也立即阻止本轮新增买单。
             known = {o.get("exchange_id"): o for o in local if o.get("exchange_id")}
             legs = []
             if str(trade.taker_order_id) in known:

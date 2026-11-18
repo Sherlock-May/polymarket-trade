@@ -49,6 +49,32 @@ async def test_partial_fill_protects_and_cancels_other(engine):
     assert len([o for o in engine.orders.values() if o["side"] == "SELL"]) == 1
 
 
+@pytest.mark.parametrize("next_action", ["threshold", "deadline", "disable"])
+async def test_partial_buy_keeps_only_its_own_remainder_until_threshold(engine, next_action):
+    await engine.manage()
+    buys = {o["asset_id"]: o for o in engine.orders.values()}
+    up = buys["up"]
+    await engine.accept_fills([asdict(Fill("almost", up["local_id"], ".10", "4.99333", "0", "actual", engine.api.now(), "MAKER"))])
+    await engine.manage()
+    assert round_(engine)["entry_closed"]
+    assert up["status"] in {"LIVE", "PARTIAL"}
+    assert buys["down"]["status"] == "CANCELED"
+    assert not any(o["side"] == "SELL" for o in engine.orders.values())
+
+    if next_action == "threshold":
+        await engine.accept_fills([asdict(Fill("remainder", up["local_id"], ".10", "0.00667", "0", "actual", engine.api.now(), "MAKER"))])
+    elif next_action == "deadline":
+        engine.api.value = round_(engine)["deadline"]
+    else:
+        engine.config.markets = [replace(engine.config.markets[0], enabled=False)]
+    await engine.manage()
+
+    assert up["status"] == "CANCELED"
+    assert sum(o["side"] == "BUY" for o in engine.orders.values()) == 2
+    exits = [o for o in engine.orders.values() if o["side"] == "SELL"]
+    assert [D(o["size"]) for o in exits] == ([D(5)] if next_action == "threshold" else [])
+
+
 async def test_fill_during_cancel_is_still_protected(engine):
     await engine.manage()
     target = next(iter(engine.orders.values()))

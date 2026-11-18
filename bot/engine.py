@@ -237,6 +237,7 @@ class Engine:
             return
         attempts += 1
         self.cancel_retries[o["local_id"]] = (attempts, time.monotonic() + min(60, 2 ** min(attempts, 6)))
+        o["cancel_requested"] = True
         o["status"] = "CANCEL_PENDING"
         self.save()
         self.emit("请求撤单", order=o["local_id"], reason=reason)
@@ -474,6 +475,18 @@ class Engine:
             except Exception as exc:
                 self.limited("止盈保护异常", token, slug=m.slug, **error_fields(exc))
 
+    def keep_partial_entry(self, order, r, cancel_at):
+        if (self.stopping or self.api.now() >= cancel_at or r.get("settlement")
+                or order["status"] not in {"LIVE", "PARTIAL"} or not order.get("exchange_id")
+                or order.get("cancel_requested")):
+            return False
+        confirmed = sum((D(f["shares"]) for f in self.fills if f["order_id"] == order["local_id"]), D(0))
+        observed = sum((D(t["shares"]) for t in order.get("early_matches", {}).values() if t["status"] != "FAILED"), D(0))
+        matched = max(D(order.get("matched", "0")), confirmed, observed)
+        book = self.feed.books.get(order["asset_id"])
+        minimum = D(book.min_size if book else r["market"]["min_size"])
+        return 0 < matched < D(order["size"]) and matched.quantize(D("0.01"), rounding=ROUND_DOWN) < minimum
+
     async def manage(self):
         rules = {r.id: r for r in self.config.markets}
         for r in self.rounds.values():
@@ -486,13 +499,15 @@ class Engine:
                 r["status"] = "WAIT_SETTLEMENT"
                 continue
             enabled = rules.get(r["rule"]["id"])
-            if enabled is None or not enabled.enabled or self.stopping:
+            configured = bool(enabled and enabled.enabled)
+            if not configured or self.stopping:
                 r["entry_closed"] = True
                 r["skip_reason"] = "配置关闭或安全停机"
             if now >= m["start"] and not r["opened_logged"]:
                 r["opened_logged"] = True
                 self.emit("新一轮已开盘", slug=m["slug"], deadline=utc_iso(r["deadline"]))
-            if now >= r["deadline"] - self.config.settings["cancel_before_deadline_seconds"]:
+            cancel_at = min(m["end"], r["deadline"] - self.config.settings["cancel_before_deadline_seconds"])
+            if now >= cancel_at:
                 r["entry_closed"] = True
                 if not r["deadline_logged"]:
                     r["deadline_logged"] = True
@@ -502,10 +517,12 @@ class Engine:
             if r["entry_closed"] or now >= m["end"]:
                 for o in list(self.orders.values()):
                     if o["slug"] == m["slug"] and o["status"] in ACTIVE and (o["side"] == "BUY" or now >= m["end"]):
+                        if configured and o["side"] == "BUY" and self.keep_partial_entry(o, r, cancel_at):
+                            continue
                         await self.cancel(o, "本轮已成交/开仓到期/配置关闭/市场结束")
             if now >= m["end"]:
                 r["status"] = "WAIT_SETTLEMENT"
-            elif enabled and enabled.enabled:
+            elif configured:
                 await self.open_round(r)
         self.save()
 
