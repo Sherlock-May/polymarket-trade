@@ -23,7 +23,7 @@ def engine(tmp_path):
     db = Database(tmp_path / "test.db")
     e = Engine(db, c, api, feed, logging.getLogger("test"))
     e.broker = PaperBroker(e)
-    rule = replace(c.markets[0], enabled=True, timeframe="15m", entry_window_seconds=120)
+    rule = replace(c.markets[0], enabled=True, timeframe="15m", entry_window_seconds=120, take_profit_enabled=True)
     e.config.markets = [rule]
     m = Market("test-round", "condition", now + 60, now + 960, {"UP": "up", "DOWN": "down"}, "0.01", "5", True, "0.07", "1", True, True)
     e.add_round(m, rule)

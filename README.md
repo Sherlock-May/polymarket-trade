@@ -54,6 +54,7 @@
 ```powershell
 # Windows：在项目根目录执行
 .\.venv\Scripts\python.exe main.py market list
+.\.venv\Scripts\python.exe main.py market format
 .\.venv\Scripts\python.exe main.py market enable btc-4h
 .\.venv\Scripts\python.exe main.py market disable btc-4h
 .\.venv\Scripts\python.exe main.py market enable sol-15m
@@ -65,6 +66,8 @@
 ```
 
 Linux 把 `.\.venv\Scripts\python.exe` 换成 `.venv/bin/python`。
+
+`market format` 将现有的 `markets.json` 整理成每个市场一行，保留配置值。使用 `market set`、`enable` 或 `disable` 保存时也用同样的格式。
 
 **运行时无需重启即可读入 `markets.json` 的有效修改。**
 

@@ -25,6 +25,25 @@ def test_market_commands_validate_and_preserve_other_rules(tmp_path):
     assert path.read_text() == before
 
 
+def test_market_format_keeps_config_and_further_edits_compact(tmp_path):
+    path = tmp_path / "markets.json"
+    raw = json.loads(open("markets.json", encoding="utf-8").read())
+    path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+    cli = parser()
+    base = ["--config", str(path), "market"]
+
+    market_command(cli.parse_args(base + ["format"]))
+    formatted = path.read_text(encoding="utf-8")
+    assert json.loads(formatted) == raw
+    assert [json.loads(line.strip().rstrip(",")) for line in formatted.splitlines() if line.lstrip().startswith('{"id"')] == raw["markets"]
+
+    market_command(cli.parse_args(base + ["set", "eth-5m", "take_profit_enabled", "false"]))
+    next(m for m in raw["markets"] if m["id"] == "eth-5m")["take_profit_enabled"] = False
+    edited = path.read_text(encoding="utf-8")
+    assert len(edited.splitlines()) == len(formatted.splitlines())
+    assert json.loads(edited) == raw
+
+
 def test_round_keeps_original_strategy_parameters(engine):
     from dataclasses import replace
     updated = replace(engine.config.markets[0], take_profit_price="0.30", take_profit_enabled=False)

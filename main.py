@@ -10,6 +10,7 @@ import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from dotenv import load_dotenv
 from bot.config import Config, live_enabled
 from bot.database import Database
@@ -38,7 +39,7 @@ def parser():
     commands.add_parser("auth-check", help="显式读取账户认证/余额/已有订单，不提交交易")
     commands.add_parser("reconcile", help="备份数据库并核对实盘旧单，仅查询账户，不下单或撤单")
     m = commands.add_parser("market", help="显示或修改市场配置，运行中自动生效")
-    m.add_argument("action", choices=["list", "enable", "disable", "set"])
+    m.add_argument("action", choices=["list", "enable", "disable", "set", "format"])
     m.add_argument("id", nargs="?")
     m.add_argument("field", nargs="?", choices=["entry_price", "shares", "take_profit_price", "take_profit_enabled", "entry_window_seconds", "preopen_seconds"])
     m.add_argument("value", nargs="?")
@@ -49,37 +50,59 @@ def parser():
     return p
 
 
+def format_market_config(raw):
+    properties = []
+    for key, value in raw.items():
+        if key == "markets" and value:
+            rows = [json.dumps(row, ensure_ascii=False, separators=(",", ":")) for row in value]
+            rendered = "[\n    " + ",\n    ".join(rows) + "\n  ]"
+        else:
+            rendered = json.dumps(value, ensure_ascii=False, indent=2).replace("\n", "\n  ")
+        properties.append(f"  {json.dumps(key, ensure_ascii=False)}: {rendered}")
+    return "{\n" + ",\n".join(properties) + "\n}\n"
+
+
 def market_command(args):
-    config = Config.load(args.config)
+    path = Path(args.config)
+    config = Config.load(path)
     if args.action == "list":
         for rule in config.markets:
             take_profit = rule.take_profit_price if rule.take_profit_enabled else "关闭（持有到结算）"
             print(f"{rule.id:10} {'开启' if rule.enabled else '关闭'}  买价={rule.entry_price} 每边份额={rule.shares} 止盈={take_profit} 挂单时长={rule.entry_window_seconds}秒")
         return
-    if not args.id:
-        raise ValueError("请指定市场 id，例如 btc-4h")
-    raw = json.loads(Path(args.config).read_text(encoding="utf-8-sig"))
-    match = [r for r in raw["markets"] if r["id"] == args.id]
-    if len(match) != 1:
-        raise ValueError("市场 id 不存在；先运行 market list")
-    r = match[0]
-    if args.action == "set":
-        if args.field is None or args.value is None:
-            raise ValueError("用法：market set btc-4h take_profit_price 0.20")
-        if args.field == "take_profit_enabled":
-            if args.value.lower() not in {"true", "false"}:
-                raise ValueError("take_profit_enabled 必须是 true 或 false")
-            r[args.field] = args.value.lower() == "true"
+    raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    if args.action != "format":
+        if not args.id:
+            raise ValueError("请指定市场 id，例如 btc-4h")
+        match = [r for r in raw["markets"] if r["id"] == args.id]
+        if len(match) != 1:
+            raise ValueError("市场 id 不存在；先运行 market list")
+        r = match[0]
+        if args.action == "set":
+            if args.field is None or args.value is None:
+                raise ValueError("用法：market set btc-4h take_profit_price 0.20")
+            if args.field == "take_profit_enabled":
+                if args.value.lower() not in {"true", "false"}:
+                    raise ValueError("take_profit_enabled 必须是 true 或 false")
+                r[args.field] = args.value.lower() == "true"
+            else:
+                r[args.field] = int(args.value) if args.field.endswith("seconds") else args.value
         else:
-            r[args.field] = int(args.value) if args.field.endswith("seconds") else args.value
+            r["enabled"] = args.action == "enable"
+
+    with NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as f:
+        tmp = Path(f.name)
+        f.write(format_market_config(raw))
+    try:
+        Config.load(tmp)
+        tmp.chmod(path.stat().st_mode & 0o777)
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    if args.action == "format":
+        print(f"已整理 {path}，每个市场占一行。")
     else:
-        r["enabled"] = args.action == "enable"
-    path = Path(args.config)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    Config.load(tmp)
-    tmp.replace(path)
-    print(f"已保存 {args.id}。市场开关运行中自动生效，止盈开关和其他策略参数用于新发现的轮次。")
+        print(f"已保存 {args.id}。市场开关运行中自动生效，止盈开关和其他策略参数用于新发现的轮次。")
 
 
 async def check(args, config):
