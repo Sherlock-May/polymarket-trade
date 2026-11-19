@@ -11,7 +11,7 @@
 3. 任一方向首次撮合即关闭该轮入口，并撤销尚未撮合的反方向买单。已部分撮合的买单，若累计撮合量低于该市场的最小卖单量，则在原买单截止前保留余量；累计达到门槛后尝试撤掉余量。库存可卖时挂固定价格 GTC 止盈。本轮不补挂买单。
 4. 撤单竞态导致两边均成交时，分别保护两个方向的持仓。部分成交按实际可卖数量处理；晚到成交继续补足止盈，禁止重复占用同一份库存。
 5. 到**实际开盘时间 + `entry_window_seconds`** 撤销剩余买单，即使部分成交仍不足最小卖单量。默认提前 1 秒发起撤单；实盘买单同时带 GTD 到期保护。网络撤单并不能保证零竞态。
-6. 止盈价就是 `take_profit_price` 的绝对价格，例如 `"0.20"`，与实际买入均价、倍数无关。不自动改价追单，不主动止损。
+6. 开启止盈时，`take_profit_price` 是固定卖价，例如 `"0.20"`。关闭止盈时，该轮买到的份额持有至结算。
 7. 市场结束后检查最终结算，尚未解决则等待；旧仓位与新一轮并行管理。实盘赎回默认关闭，需有可用钱包操作授权才能启用。
 
 “下一轮”来自官方系列及时间，不是取最远的市场，也不通过 UTC 时间取整猜 4 小时窗口。官方 `startDate` 常是创建时间，程序不用它当开盘时间。
@@ -29,6 +29,7 @@
   "entry_price": "0.10",
   "shares": "10",
   "take_profit_price": "0.20",
+  "take_profit_enabled": true,
   "entry_window_seconds": 3600,
   "preopen_seconds": 86400
 }
@@ -42,6 +43,7 @@
 | `entry_price` | 两边买单的固定限价 |
 | `shares` | **每个方向**的份额，不是投入金额 |
 | `take_profit_price` | 固定止盈卖价，不是倍数 |
+| `take_profit_enabled` | 默认 `true`。设为 `false` 后，新发现的轮次持有到结算 |
 | `entry_window_seconds` | 从市场实际开盘算起，未成交买单最多保留多久 |
 | `preopen_seconds` | 允许提前多久挂单；86400 表示最近下一轮一经发现即可提前挂，最多提前一天 |
 
@@ -59,6 +61,7 @@
 .\.venv\Scripts\python.exe main.py market set sol-15m shares 10
 .\.venv\Scripts\python.exe main.py market set sol-15m entry_price 0.10
 .\.venv\Scripts\python.exe main.py market set sol-15m take_profit_price 0.21
+.\.venv\Scripts\python.exe main.py market set sol-15m take_profit_enabled false
 ```
 
 Linux 把 `.\.venv\Scripts\python.exe` 换成 `.venv/bin/python`。
@@ -68,7 +71,7 @@ Linux 把 `.\.venv\Scripts\python.exe` 换成 `.venv/bin/python`。
 - 关闭某个市场：停止新开仓，撤销本程序在该市场剩余的买单；已有持仓继续挂止盈与等待结算。
 - 开启某个市场：下次发现周期内开始查找下一轮，默认最长约 30 秒。
 - 同时开启多个市场：分别管理，受合计总敞口和资金限额约束。
-- 修改价格、份额、止盈价、挂单时间：用于**新发现的轮次**；已发现轮次使用持久化的参数快照，重启也不会改写。关闭后重新打开不重置本轮进场次数。
+- 修改价格、份额、止盈开关、挂单时间：用于**新发现的轮次**。已发现轮次和已经挂出的订单继续使用原策略。关闭后重新打开不重置本轮进场次数。
 - 修改 `.env`、密钥、模拟/实盘模式：需要重启。模式禁止热切换。
 - JSON 无效：保留上一份有效配置，记录错误，修正文件后自动重读。
 

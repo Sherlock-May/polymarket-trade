@@ -193,6 +193,7 @@ class Engine:
                 o["status"] = "FILLED"
             self.save()
             self.emit("真实成交" if self.mode == "live" else "模拟成交", slug=o["slug"], side=o["side"], asset=o["asset_id"],
+                      take_profit_enabled=self.rounds[o["slug"]]["rule"].get("take_profit_enabled", True),
                       order=o['local_id'], matched_at=f['timestamp'], price=f["price"], shares=f["shares"], fee=f["fee"], fee_kind=f["fee_kind"], fill_id=f["id"])
         if self.mode == "live":
             # 确认成交后先保护库存，不等待队列中下一次全账户对账。
@@ -324,7 +325,8 @@ class Engine:
                     raise ValueError("等待新鲜完整盘口")
                 m.tick, m.min_size = b.tick, b.min_size
                 m.validate_order(rule.entry_price, rule.shares)
-                m.validate_order(rule.take_profit_price, rule.shares)
+                if rule.take_profit_enabled:
+                    m.validate_order(rule.take_profit_price, rule.shares)
             if not m.fee_known:
                 raise ValueError("未知费率，禁止盲目估算成本")
             budget = 2 * D(rule.entry_price) * D(rule.shares)
@@ -375,6 +377,8 @@ class Engine:
         return pending
 
     def request_fast_protection(self, slug):
+        if not self.rounds[slug]["rule"].get("take_profit_enabled", True):
+            return
         task = self.fast_protect_tasks.get(slug)
         if self.stopping or (task and not task.done()):
             return
@@ -413,7 +417,8 @@ class Engine:
                 if not 0 < D(price) <= D(o['price']):
                     raise ValueError('买入撮合通知越过限价，要求对账')
                 entries[str(trade.id)] = {'shares': str(size), 'status': trade.status}
-                self.rounds[o['slug']]['entry_closed'] = True
+                r = self.rounds[o['slug']]
+                r['entry_closed'] = True
                 pending = sum((D(t['shares']) for t in entries.values() if t['status'] != 'FAILED'), D(0))
                 o['matched'] = str(max(D(o.get('matched', '0')), min(D(o['size']), pending)))
                 stamp = getattr(trade, 'matched_at', None)
@@ -421,7 +426,8 @@ class Engine:
                     o['first_match_at'] = stamp.timestamp()
                     o['first_match_received_at'] = received_at
                 self.db.put_order(o)
-                self.limited('收到撮合通知立即检查止盈', o['local_id'], order=o['local_id'], slug=o['slug'],
+                matched_event = '收到撮合通知立即检查止盈' if r['rule'].get('take_profit_enabled', True) else '收到撮合通知'
+                self.limited(matched_event, o['local_id'], order=o['local_id'], slug=o['slug'],
                              status=trade.status, matched_at=stamp.timestamp() if stamp else None,
                              received_at=received_at, processed_at=time.time(), source='websocket' if received_at is not None else 'rest')
                 if trade.status == 'FAILED':
@@ -431,7 +437,7 @@ class Engine:
 
     async def _protect(self, r):
         m, rule = self.market(r["market"]["slug"]), Rule(**r["rule"])
-        if self.api.now() >= m.end or r.get("settlement"):
+        if not rule.take_profit_enabled or self.api.now() >= m.end or r.get("settlement"):
             return
         for token in m.tokens.values():
             own = D(self.position(m.slug, token)["shares"])

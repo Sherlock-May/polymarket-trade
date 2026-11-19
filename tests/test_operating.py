@@ -6,7 +6,7 @@ from bot.config import Config
 from bot.lock import ProcessLock
 from bot.reporting import report
 from bot.models import Fill
-from main import market_command
+from main import market_command, parser
 
 
 def test_market_commands_validate_and_preserve_other_rules(tmp_path):
@@ -27,8 +27,33 @@ def test_market_commands_validate_and_preserve_other_rules(tmp_path):
 
 def test_round_keeps_original_strategy_parameters(engine):
     from dataclasses import replace
-    engine.config.markets[0] = replace(engine.config.markets[0], take_profit_price="0.30")
-    assert engine.rounds["test-round"]["rule"]["take_profit_price"] == "0.20"
+    updated = replace(engine.config.markets[0], take_profit_price="0.30", take_profit_enabled=False)
+    engine.config.markets[0] = updated
+    engine.add_round(replace(engine.market("test-round"), slug="next-round"), updated)
+    old_rule = engine.rounds["test-round"]["rule"]
+    assert old_rule["take_profit_price"] == "0.20" and old_rule["take_profit_enabled"]
+    assert not engine.rounds["next-round"]["rule"]["take_profit_enabled"]
+
+
+def test_take_profit_switch_accepts_boolean_and_leaves_market_enabled(tmp_path, capsys):
+    path = tmp_path / "markets.json"
+    raw = json.loads(open("markets.json", encoding="utf-8").read())
+    next(r for r in raw["markets"] if r["id"] == "eth-5m")["enabled"] = True
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    cli = parser()
+    base = ["--config", str(path), "market"]
+    change = base + ["set", "eth-5m", "take_profit_enabled"]
+
+    market_command(cli.parse_args(change + ["false"]))
+    rule = next(r for r in Config.load(path).markets if r.id == "eth-5m")
+    assert not rule.take_profit_enabled and rule.enabled
+    market_command(cli.parse_args(base + ["list"]))
+    assert "止盈=关闭（持有到结算）" in capsys.readouterr().out
+
+    with pytest.raises(ValueError, match="take_profit_enabled"):
+        market_command(cli.parse_args(change + ["0"]))
+    market_command(cli.parse_args(change + ["true"]))
+    assert next(r for r in Config.load(path).markets if r.id == "eth-5m").take_profit_enabled
 
 
 def test_single_instance_lock(tmp_path):

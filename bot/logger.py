@@ -97,9 +97,10 @@ def simple_message(db, name, data, now):
         return f"旧止盈单已结束 | {label} | 市场已结算且无活动挂单，收益以成交及结算记录为准"
     if name == '恢复待预挂轮次':
         return f"恢复待预挂 | {label} | 上次退出前未下过单，重新等待预挂检查"
-    if name == '收到撮合通知立即检查止盈':
+    if name in {'收到撮合通知', '收到撮合通知立即检查止盈'}:
         matched = _local_time(data['matched_at']) if data.get('matched_at') else '未提供'
-        return f"收到撮合通知 | {label} | 订单 {order_id} | 状态 {data.get('status')} | 实际撮合 {matched} | 已触发可卖余额检查，尚不代表止盈成功"
+        action = '本轮关闭止盈，持有到结算' if name == '收到撮合通知' else '已触发可卖余额检查，尚不代表止盈成功'
+        return f"收到撮合通知 | {label} | 订单 {order_id} | 状态 {data.get('status')} | 实际撮合 {matched} | {action}"
     if name == '撮合失败需核实持仓':
         return f"撮合失败需核实持仓 | {label} | 订单 {order_id}"
     if name == '撮合到止盈提交结果':
@@ -162,6 +163,8 @@ def trade_message(db, name, data, message):
         timestamp = data.get('matched_at')
         timing = _local_time(timestamp) if timestamp is not None else '未提供'
         result = '买入已成交，止盈结果待后续确认' if data['side'] == 'BUY' else '止盈卖出已成交（可能为部分成交）'
+        if data['side'] == 'BUY' and not data.get('take_profit_enabled', True):
+            result = '买入已成交，持有到结算'
         return f"{result} | {message} | 订单 {data.get('order', '?')} | 实际撮合 {timing}"
     order_id = data.get('order')
     row = db.conn.execute('SELECT data FROM orders WHERE local_id=?', (order_id,)).fetchone() if order_id else None
@@ -169,6 +172,6 @@ def trade_message(db, name, data, message):
     if order and order['purpose'] == 'TAKE_PROFIT' and name in {'订单被接受', '订单被拒绝', '订单未发送', '提交结果未知禁止重复下单', '撤单已确认'}:
         buys = [o['local_id'] for o in db.orders() if o['slug'] == order['slug'] and o['asset_id'] == order['asset_id'] and o['side'] == 'BUY']
         return f"{message} | 止盈订单 {order_id} | 对应买单 {','.join(buys)}"
-    if name in {'撮合到止盈提交结果', '收到撮合通知立即检查止盈', '撮合失败需核实持仓', '止盈处理中', '持仓暂不可挂止盈', '止盈保护异常', '止盈处理耗时', '止盈重试暂停需检查', '最终结算已确认'}:
+    if name in {'撮合到止盈提交结果', '收到撮合通知', '收到撮合通知立即检查止盈', '撮合失败需核实持仓', '止盈处理中', '持仓暂不可挂止盈', '止盈保护异常', '止盈处理耗时', '止盈重试暂停需检查', '最终结算已确认'}:
         return message
     return None

@@ -27,10 +27,13 @@ class Rule:
     take_profit_price: str
     entry_window_seconds: int
     preopen_seconds: int = 86400
+    take_profit_enabled: bool = True
 
     def __post_init__(self):
         if type(self.enabled) is not bool:
             raise ValueError("enabled 必须是 true 或 false")
+        if type(self.take_profit_enabled) is not bool:
+            raise ValueError("take_profit_enabled 必须是 true 或 false")
         if self.symbol not in {"BTC", "ETH", "SOL"} or self.timeframe not in PERIODS:
             raise ValueError("仅支持 BTC/ETH/SOL 和 5m/15m/1h/4h")
         if not 0 < D(self.entry_price) < D(self.take_profit_price) < 1:

@@ -40,7 +40,7 @@ def parser():
     m = commands.add_parser("market", help="显示或修改市场配置，运行中自动生效")
     m.add_argument("action", choices=["list", "enable", "disable", "set"])
     m.add_argument("id", nargs="?")
-    m.add_argument("field", nargs="?", choices=["entry_price", "shares", "take_profit_price", "entry_window_seconds", "preopen_seconds"])
+    m.add_argument("field", nargs="?", choices=["entry_price", "shares", "take_profit_price", "take_profit_enabled", "entry_window_seconds", "preopen_seconds"])
     m.add_argument("value", nargs="?")
     replay = commands.add_parser("replay", help="回放已保存的模拟行情和轮次，不访问网络")
     replay.add_argument("recording")
@@ -53,7 +53,8 @@ def market_command(args):
     config = Config.load(args.config)
     if args.action == "list":
         for rule in config.markets:
-            print(f"{rule.id:10} {'开启' if rule.enabled else '关闭'}  买价={rule.entry_price} 每边份额={rule.shares} 止盈={rule.take_profit_price} 挂单时长={rule.entry_window_seconds}秒")
+            take_profit = rule.take_profit_price if rule.take_profit_enabled else "关闭（持有到结算）"
+            print(f"{rule.id:10} {'开启' if rule.enabled else '关闭'}  买价={rule.entry_price} 每边份额={rule.shares} 止盈={take_profit} 挂单时长={rule.entry_window_seconds}秒")
         return
     if not args.id:
         raise ValueError("请指定市场 id，例如 btc-4h")
@@ -65,7 +66,12 @@ def market_command(args):
     if args.action == "set":
         if args.field is None or args.value is None:
             raise ValueError("用法：market set btc-4h take_profit_price 0.20")
-        r[args.field] = int(args.value) if args.field.endswith("seconds") else args.value
+        if args.field == "take_profit_enabled":
+            if args.value.lower() not in {"true", "false"}:
+                raise ValueError("take_profit_enabled 必须是 true 或 false")
+            r[args.field] = args.value.lower() == "true"
+        else:
+            r[args.field] = int(args.value) if args.field.endswith("seconds") else args.value
     else:
         r["enabled"] = args.action == "enable"
     path = Path(args.config)
@@ -73,7 +79,7 @@ def market_command(args):
     tmp.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     Config.load(tmp)
     tmp.replace(path)
-    print(f"已保存 {args.id}；开关运行中自动生效，价格/份额/时间参数用于新发现的轮次。")
+    print(f"已保存 {args.id}。市场开关运行中自动生效，止盈开关和其他策略参数用于新发现的轮次。")
 
 
 async def check(args, config):

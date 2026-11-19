@@ -41,6 +41,7 @@ async def finish(engine):
 
 async def test_match_checks_balance_then_sells_before_confirmation(engine):
     order, posts = await setup_live(engine, [0, 10000000])
+    del engine.rounds['test-round']['rule']['take_profit_enabled']  # 历史轮次默认继续止盈
     matched = event(engine)
     await engine.on_message('user_update', matched)
     await engine.on_message('user_update', matched)
@@ -52,6 +53,22 @@ async def test_match_checks_balance_then_sells_before_confirmation(engine):
     await finish(engine)
     assert len(posts) == 1 and len(engine.fills) == 1
     assert engine.unconfirmed_buy_shares('test-round', 'up') == 0
+
+
+async def test_live_take_profit_disabled_still_records_confirmed_buys(engine):
+    order, posts = await setup_live(engine, [10000000])
+    r = engine.rounds['test-round']
+    r['rule']['take_profit_enabled'] = False
+    async def unexpected_balance_check(*args):
+        pytest.fail('disabled take profit should not check sellable balance')
+    engine.broker.available = unexpected_balance_check
+
+    await engine.on_message('user_update', event(engine))
+    await engine.on_message('user_update', event(engine, status='CONFIRMED'))
+    await engine.protect(r)
+    assert engine.fast_protect_tasks == {}
+    assert posts == [] and len(engine.fills) == 1
+    assert D(engine.position('test-round', 'up')['shares']) == 10
 
 
 async def test_failed_match_never_sells_and_ignores_stale_match(engine):
@@ -101,10 +118,12 @@ async def test_live_buy_remainder_is_kept_until_cumulative_matches_reach_market_
 @pytest.mark.parametrize('delay', [0, 1])
 async def test_early_exit_confirmation_waits_for_buy_accounting(engine, delay):
     buy, posts = await setup_live(engine, [10000000])
-    await engine.on_message('user_update', event(engine))
+    matched = event(engine)
+    await engine.on_message('user_update', matched)
     await finish(engine)
     sell = next(o for o in engine.orders.values() if o['side'] == 'SELL')
-    sold = asdict(Fill('aaa-sell-fill', sell['local_id'], '.20', '10', '0', 'actual', engine.api.now() + delay, 'MAKER'))
+    sold_at = matched.payload.matched_at.timestamp() + delay
+    sold = asdict(Fill('aaa-sell-fill', sell['local_id'], '.20', '10', '0', 'actual', sold_at, 'MAKER'))
     await engine.accept_fills([sold])
     assert not engine.fills and 'aaa-sell-fill' in engine.deferred_sell_fills
     await engine.on_message('user_update', event(engine, status='CONFIRMED'))
